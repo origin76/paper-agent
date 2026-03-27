@@ -98,6 +98,60 @@ def build_resource_discovery_prompt(
 """
 
 
+def build_url_resource_enrichment_prompt(page_contexts: list[dict[str, Any]]) -> str:
+    return f"""你在为论文精读 agent 清洗外部资源链接名称。
+当前一些标题是非常差的占位词，例如“论文内提到的官方页面”“论文内提到的 GitHub 仓库”。这类标题一律不能保留。
+
+下面是从真实 URL 抓取到的 HTML 上下文：
+{json.dumps(page_contexts, indent=2, ensure_ascii=False)}
+
+返回一个 JSON 对象，必须包含：
+- pages: [{{"url": string, "clean_title": string, "page_kind": string, "summary": string}}]
+
+规则：
+- clean_title 必须具体、可读、像人会给网页起的名字。
+- 禁止输出泛化标题，例如“官方页面”“资源页面”“论文内提到的页面”“代码仓库”。
+- 如果是 GitHub 仓库，标题优先具体到项目或 owner/repo。
+- 如果是会议页面，标题要体现会议或演讲页面身份。
+- 如果是 Zenodo / DOI / artifact 页面，标题要明确写出 artifact、Zenodo 或 DOI。
+- page_kind 用简短 snake_case 英文标识，例如 conference_page / github_repository / artifact_page / technical_reference。
+- summary 用 1 句简体中文，说明为什么这个页面值得点开。
+- 只根据给出的 URL 上下文命名，不要凭空编造页面没有的信息。
+- JSON 键名必须与上面完全一致。
+- 所有 value 必须使用简体中文，page_kind 除外。
+- 不要输出额外的键。
+"""
+
+
+def build_url_resource_search_fallback_prompt(
+    overview: dict[str, Any],
+    failed_page_contexts: list[dict[str, Any]],
+) -> str:
+    return f"""你在为论文精读 agent 做一个“弱补全”阶段。
+这些 URL 在直接抓取 HTML 时失败了（例如 403 / 404），所以你需要使用联网搜索结果页摘要、搜索索引标题和公开网页线索，尽可能补全它们的页面名称与用途。
+
+论文 overview：
+{json.dumps(overview, indent=2, ensure_ascii=False)}
+
+抓取失败的 URL 上下文：
+{json.dumps(failed_page_contexts, indent=2, ensure_ascii=False)}
+
+返回一个 JSON 对象，必须包含：
+- pages: [{{"url": string, "clean_title": string, "page_kind": string, "summary": string}}]
+
+规则：
+- 这是弱补全，不要伪造你无法确认的细节。
+- 优先根据 URL、搜索结果标题、站点已知结构来命名。
+- clean_title 必须具体、可读，不能是“官方页面”“资源页面”“论文内提到的页面”这类占位词。
+- page_kind 用简短 snake_case 英文标识，例如 conference_page / conference_index / technical_reference / github_repository / artifact_page。
+- summary 用 1 句简体中文，说明用户为什么值得点开。
+- 如果只是弱确认，也要给出尽量稳妥、不过度承诺的描述。
+- JSON 键名必须与上面完全一致。
+- 所有 value 必须使用简体中文，page_kind 除外。
+- 不要输出额外的键。
+"""
+
+
 def build_section_prompt(
     section_title: str,
     overview: dict[str, Any],

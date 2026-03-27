@@ -63,6 +63,10 @@ def main() -> int:
 
     print(f"Artifacts written to: {result['run_dir']}")
     print(f"Final report: {result['run_dir']}/final_report.md")
+    if result.get("report_exports", {}).get("html", {}).get("path"):
+        print(f"HTML report: {result['report_exports']['html']['path']}")
+    if result.get("report_exports", {}).get("pdf", {}).get("path"):
+        print(f"PDF report: {result['report_exports']['pdf']['path']}")
 
     if args.print_report:
         print("")

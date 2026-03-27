@@ -2,7 +2,7 @@
 
 This repository contains a minimal deep paper-reading agent built for one job:
 
-`PDF -> local text extraction -> qwen3.5-plus -> multi-stage analysis -> Markdown report`
+`PDF -> local text extraction -> qwen3.5-plus -> multi-stage analysis -> Markdown / HTML / PDF report`
 
 The goal is not a cheap summary. The goal is to spend more tokens on one paper and get closer to an advisor-style guided reading.
 
@@ -22,7 +22,9 @@ So the pipeline now works like this:
 2. Heuristically split the paper into sections
 3. Run all analysis stages with `qwen3.5-plus`
 4. Enable model-side web search when `PAPER_AGENT_WEB_SEARCH_ENABLED=true`
-5. Write every intermediate artifact and log to a run directory
+5. Fetch high-value resource URLs, parse HTML titles/snippets, and let the model clean up generic link names
+6. Render the final report as Markdown, readable HTML, and printable PDF
+7. Write every intermediate artifact and log to a run directory
 
 ## Workflow
 
@@ -34,12 +36,13 @@ Stages:
 2. `global_overview`
 3. `web_research`
 4. `resource_discovery`
-5. `structure_breakdown`
-6. `section_deep_dive`
-7. `experiment_review`
-8. `critique`
-9. `extensions`
-10. `render_report`
+5. `url_resource_enrichment`
+6. `structure_breakdown`
+7. `section_deep_dive`
+8. `experiment_review`
+9. `critique`
+10. `extensions`
+11. `render_report`
 
 ## Requirements
 
@@ -89,6 +92,16 @@ Optional:
   - default: `180000`
 - `PAPER_AGENT_SECTION_TARGET_CHARS`
   - default: `24000`
+- `PAPER_AGENT_URL_CONTENT_ENRICHMENT_ENABLED`
+  - default: `true`
+- `PAPER_AGENT_URL_CONTENT_ENRICHMENT_MAX_URLS`
+  - default: `8`
+- `PAPER_AGENT_URL_FETCH_TIMEOUT_SECONDS`
+  - default: `12`
+- `PAPER_AGENT_URL_FETCH_MAX_BYTES`
+  - default: `600000`
+- `PAPER_AGENT_URL_FETCH_MAX_TEXT_CHARS`
+  - default: `6000`
 - `PAPER_AGENT_PDF_EXTRACT_TIMEOUT_SECONDS`
   - default: `60`
 - `PAPER_AGENT_TEMPERATURE`
@@ -138,6 +151,10 @@ runs/20260327-120000-some-paper/
 ├── web_search_queries.json
 ├── web_research.json
 ├── resource_discovery.json
+├── url_resource_candidates.json
+├── url_resource_contexts.json
+├── url_resource_enrichment.json
+├── url_resource_enrichment_meta.json
 ├── structure.json
 ├── selected_sections.json
 ├── section_targets.json
@@ -146,9 +163,20 @@ runs/20260327-120000-some-paper/
 ├── critique.md
 ├── extensions.md
 ├── final_report.md
+├── final_report.html
+├── final_report.pdf
+├── report_export_meta.json
 ├── cleanup_result.json
 └── run_summary.json
 ```
+
+The HTML output is styled for comfortable on-screen reading, while the PDF is generated locally with `reportlab` so it does not depend on browser print pipelines or system-specific converters.
+
+The URL enrichment artifacts are especially useful when a report contains vague resource names. They show:
+
+- which URLs were selected for HTML fetching
+- which fetches failed because of 403/404 or other network restrictions
+- which cleaned titles and one-line summaries were produced from fetched page content
 
 ## Logging
 

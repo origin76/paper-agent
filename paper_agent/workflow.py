@@ -9,6 +9,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from paper_agent.config import RuntimeConfig
+from paper_agent.exporters import build_report_document, export_html_report, export_pdf_report
 from paper_agent.kimi_client import KimiClient
 from paper_agent.pdf_extract import extract_pdf_text
 from paper_agent.prompts import (
@@ -19,12 +20,23 @@ from paper_agent.prompts import (
     build_overview_prompt,
     build_resource_discovery_prompt,
     build_section_prompt,
+    build_url_resource_enrichment_prompt,
+    build_url_resource_search_fallback_prompt,
     build_structure_prompt,
     build_web_research_summary_prompt,
 )
 from paper_agent.report import render_report
 from paper_agent.runtime import append_stage_trace, configure_logging, log_event
 from paper_agent.sections import detect_sections, select_experiment_sections
+from paper_agent.url_enrichment import (
+    apply_resource_url_enrichment,
+    build_analysis_map,
+    build_enrichment_contexts_for_prompt,
+    build_failed_page_contexts_for_prompt,
+    collect_resource_url_candidates,
+    fetch_url_context,
+    normalize_resource_payload,
+)
 from paper_agent.utils import extract_paper_web_signals, trim_balanced_text, write_json, write_text
 from paper_agent.web_search import build_search_queries
 
@@ -46,6 +58,9 @@ class PaperState(TypedDict, total=False):
     web_research_meta: dict[str, Any]
     resource_discovery: dict[str, Any]
     resource_discovery_meta: dict[str, Any]
+    url_resource_contexts: list[dict[str, Any]]
+    url_resource_enrichment: dict[str, Any]
+    url_resource_enrichment_meta: dict[str, Any]
     structure: dict[str, Any]
     structure_meta: dict[str, Any]
     section_targets: list[str]
@@ -59,6 +74,7 @@ class PaperState(TypedDict, total=False):
     extensions: str
     extensions_meta: dict[str, Any]
     report_markdown: str
+    report_exports: dict[str, Any]
     cleanup_result: dict[str, Any]
 
 
@@ -74,6 +90,7 @@ class PaperAnalysisWorkflow:
         graph.add_node("global_overview", self.global_overview)
         graph.add_node("web_research", self.web_research)
         graph.add_node("resource_discovery", self.resource_discovery)
+        graph.add_node("url_resource_enrichment", self.url_resource_enrichment)
         graph.add_node("structure_breakdown", self.structure_breakdown)
         graph.add_node("section_deep_dive", self.section_deep_dive)
         graph.add_node("experiment_review", self.experiment_review)
@@ -86,7 +103,8 @@ class PaperAnalysisWorkflow:
         graph.add_edge("ingest_pdf", "global_overview")
         graph.add_edge("global_overview", "web_research")
         graph.add_edge("web_research", "resource_discovery")
-        graph.add_edge("resource_discovery", "structure_breakdown")
+        graph.add_edge("resource_discovery", "url_resource_enrichment")
+        graph.add_edge("url_resource_enrichment", "structure_breakdown")
         graph.add_edge("structure_breakdown", "section_deep_dive")
         graph.add_edge("section_deep_dive", "experiment_review")
         graph.add_edge("experiment_review", "critique")
@@ -670,6 +688,7 @@ class PaperAnalysisWorkflow:
                 resource_discovery,
                 state.get("paper_web_signals") or {},
             )
+            resource_discovery = normalize_resource_payload(resource_discovery)
             write_json(run_dir / "resource_discovery.json", resource_discovery)
             write_json(run_dir / "resource_discovery_meta.json", meta)
             self._stage_finish(
@@ -690,6 +709,169 @@ class PaperAnalysisWorkflow:
                 "resource_discovery": empty_payload,
                 "resource_discovery_meta": {"enabled": False, "error": str(exc)},
             }
+
+    def url_resource_enrichment(self, state: PaperState) -> PaperState:
+        stage = "url_resource_enrichment"
+        run_dir = Path(state["run_dir"])
+        candidates = collect_resource_url_candidates(
+            state.get("web_research"),
+            state.get("resource_discovery"),
+            limit=self.config.url_content_enrichment_max_urls,
+        )
+        self._stage_start(
+            state,
+            stage,
+            enabled=self.config.url_content_enrichment_enabled,
+            candidate_count=len(candidates),
+        )
+
+        fetched_contexts: list[dict[str, Any]] = []
+        fetch_failures: list[dict[str, Any]] = []
+        analyzed_payload: dict[str, Any] = {"pages": [], "search_fallback_pages": []}
+        analyzed_pages: dict[str, dict[str, Any]] = {}
+
+        try:
+            if self.config.url_content_enrichment_enabled and candidates:
+                max_workers = min(4, max(1, len(candidates)))
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_url = {
+                        executor.submit(
+                            fetch_url_context,
+                            candidate["url"],
+                            self.config.url_fetch_timeout_seconds,
+                            self.config.url_fetch_max_bytes,
+                            self.config.url_fetch_max_text_chars,
+                        ): candidate["url"]
+                        for candidate in candidates
+                    }
+                    for future in as_completed(future_to_url):
+                        url = future_to_url[future]
+                        try:
+                            context = future.result()
+                            fetched_contexts.append(context)
+                            log_event(
+                                "info",
+                                "URL content fetch finished",
+                                stage=stage,
+                                url=url,
+                                final_url=context.get("final_url"),
+                                html_title=context.get("html_title"),
+                            )
+                        except Exception as exc:
+                            failure = {"url": url, "error": str(exc)}
+                            fetch_failures.append(failure)
+                            log_event("warning", "URL content fetch failed", stage=stage, url=url, error=str(exc))
+
+                fetched_contexts.sort(key=lambda item: str(item.get("url") or ""))
+                prompt_contexts = build_enrichment_contexts_for_prompt(candidates, fetched_contexts)
+                if prompt_contexts:
+                    analyzed_payload, analysis_meta = self.client.chat_json(
+                        messages=[
+                            {"role": "system", "content": BASE_SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": build_url_resource_enrichment_prompt(prompt_contexts),
+                            },
+                        ],
+                        model=self.config.document_model,
+                        enable_thinking=False,
+                        enable_search=False,
+                        stage=f"{stage}.analyze",
+                    )
+                    analyzed_pages = build_analysis_map(analyzed_payload)
+                else:
+                    analysis_meta = {"enabled": False, "reason": "no_fetch_success"}
+
+                if fetch_failures:
+                    fallback_prompt_contexts = build_failed_page_contexts_for_prompt(candidates, fetch_failures)
+                    if fallback_prompt_contexts:
+                        fallback_pages_payload, search_fallback_meta = self.client.chat_json(
+                            messages=[
+                                {"role": "system", "content": BASE_SYSTEM_PROMPT},
+                                {
+                                    "role": "user",
+                                    "content": build_url_resource_search_fallback_prompt(
+                                        state["overview"],
+                                        fallback_prompt_contexts,
+                                    ),
+                                },
+                            ],
+                            model=self.config.document_model,
+                            enable_thinking=False,
+                            enable_search=True,
+                            stage=f"{stage}.search_fallback",
+                        )
+                        analyzed_payload["search_fallback_pages"] = fallback_pages_payload.get("pages", [])
+                        analyzed_pages = build_analysis_map(analyzed_payload)
+                    else:
+                        search_fallback_meta = {"enabled": False, "reason": "no_failed_candidates"}
+                else:
+                    search_fallback_meta = {"enabled": False, "reason": "no_fetch_failures"}
+            else:
+                analysis_meta = {
+                    "enabled": False,
+                    "reason": "disabled" if not self.config.url_content_enrichment_enabled else "no_candidates",
+                }
+                search_fallback_meta = {"enabled": False, "reason": analysis_meta["reason"]}
+
+            enriched_web_research, enriched_resource_discovery = apply_resource_url_enrichment(
+                state.get("web_research"),
+                state.get("resource_discovery"),
+                fetched_contexts,
+                analyzed_pages,
+            )
+
+            enrichment_meta = {
+                "enabled": self.config.url_content_enrichment_enabled,
+                "candidate_count": len(candidates),
+                "fetched_count": len(fetched_contexts),
+                "fetch_failures": fetch_failures,
+                "analysis_meta": analysis_meta,
+                "search_fallback_meta": search_fallback_meta,
+                "analyzed_page_count": len(analyzed_pages),
+                "search_fallback_page_count": len(analyzed_payload.get("search_fallback_pages") or []),
+            }
+
+            write_json(run_dir / "url_resource_candidates.json", candidates)
+            write_json(run_dir / "url_resource_contexts.json", fetched_contexts)
+            write_json(run_dir / "url_resource_enrichment.json", analyzed_payload)
+            write_json(run_dir / "url_resource_enrichment_meta.json", enrichment_meta)
+            write_json(run_dir / "web_research.json", enriched_web_research)
+            write_json(run_dir / "resource_discovery.json", enriched_resource_discovery)
+
+            self._stage_finish(
+                state,
+                stage,
+                candidate_count=len(candidates),
+                fetched_count=len(fetched_contexts),
+                analyzed_page_count=len(analyzed_pages),
+                search_fallback_page_count=len(analyzed_payload.get("search_fallback_pages") or []),
+            )
+            return {
+                "web_research": enriched_web_research,
+                "resource_discovery": enriched_resource_discovery,
+                "url_resource_contexts": fetched_contexts,
+                "url_resource_enrichment": analyzed_payload,
+                "url_resource_enrichment_meta": enrichment_meta,
+            }
+        except Exception as exc:
+            self._stage_error(state, stage, exc, candidate_count=len(candidates), fetched_count=len(fetched_contexts))
+            write_json(run_dir / "url_resource_candidates.json", candidates)
+            write_json(run_dir / "url_resource_contexts.json", fetched_contexts)
+            write_json(run_dir / "url_resource_enrichment.json", analyzed_payload)
+            write_json(
+                run_dir / "url_resource_enrichment_meta.json",
+                {
+                    "enabled": self.config.url_content_enrichment_enabled,
+                    "candidate_count": len(candidates),
+                    "fetched_count": len(fetched_contexts),
+                    "fetch_failures": fetch_failures,
+                    "analysis_meta": analysis_meta if "analysis_meta" in locals() else {},
+                    "search_fallback_meta": search_fallback_meta if "search_fallback_meta" in locals() else {},
+                    "error": str(exc),
+                },
+            )
+            raise
 
     def structure_breakdown(self, state: PaperState) -> PaperState:
         stage = "structure_breakdown"
@@ -893,25 +1075,78 @@ class PaperAnalysisWorkflow:
         self._stage_start(state, stage)
         try:
             report_markdown = render_report(state)
+            report_document = build_report_document(
+                report_markdown,
+                title=state["overview"].get("paper_title") or state["source_name"],
+            )
             write_text(run_dir / "final_report.md", report_markdown)
+            summary = {
+                "pdf_path": state["pdf_path"],
+                "run_dir": state["run_dir"],
+                "document_model": state["overview_meta"].get("model"),
+                "analysis_model": state["critique_meta"].get("model"),
+                "requested_analysis_model": state["critique_meta"].get("requested_model"),
+                "analysis_fallback_used": state["critique_meta"].get("fallback_used", False),
+                "sections": len(state.get("section_targets") or []),
+                "paper_char_count": state["paper_text_meta"].get("char_count"),
+                "web_search_enabled": state.get("web_search_enabled", False),
+                "web_sources": len((state.get("web_research") or {}).get("source_shortlist", [])),
+                "resource_repositories": len((state.get("resource_discovery") or {}).get("code_repositories", [])),
+                "url_content_enrichment_enabled": self.config.url_content_enrichment_enabled,
+                "url_content_enrichment_candidates": (state.get("url_resource_enrichment_meta") or {}).get("candidate_count"),
+                "url_content_fetched_pages": (state.get("url_resource_enrichment_meta") or {}).get("fetched_count"),
+                "url_content_analyzed_pages": (state.get("url_resource_enrichment_meta") or {}).get("analyzed_page_count"),
+            }
+
+            html_stage = f"{stage}.html_export"
+            append_stage_trace(run_dir, html_stage, "started", output_path=str(run_dir / "final_report.html"))
+            log_event("info", "Report HTML export started", stage=html_stage, output_path=run_dir / "final_report.html")
+            html_export_meta = export_html_report(
+                report_document,
+                run_dir / "final_report.html",
+                metadata=summary,
+            )
+            append_stage_trace(run_dir, html_stage, "finished", **html_export_meta)
+            log_event("info", "Report HTML export finished", stage=html_stage, output_path=run_dir / "final_report.html")
+
+            pdf_stage = f"{stage}.pdf_export"
+            append_stage_trace(run_dir, pdf_stage, "started", output_path=str(run_dir / "final_report.pdf"))
+            log_event("info", "Report PDF export started", stage=pdf_stage, output_path=run_dir / "final_report.pdf")
+            pdf_export_meta = export_pdf_report(
+                report_document,
+                run_dir / "final_report.pdf",
+                metadata=summary,
+            )
+            append_stage_trace(run_dir, pdf_stage, "finished", **pdf_export_meta)
+            log_event("info", "Report PDF export finished", stage=pdf_stage, output_path=run_dir / "final_report.pdf")
+
+            report_exports = {
+                "markdown": {
+                    "format": "markdown",
+                    "path": str(run_dir / "final_report.md"),
+                },
+                "html": html_export_meta,
+                "pdf": pdf_export_meta,
+            }
+            write_json(run_dir / "report_export_meta.json", report_exports)
+            summary.update(
+                {
+                    "html_report_path": html_export_meta["path"],
+                    "pdf_report_path": pdf_export_meta["path"],
+                }
+            )
             write_json(
                 run_dir / "run_summary.json",
-                {
-                    "pdf_path": state["pdf_path"],
-                    "run_dir": state["run_dir"],
-                    "document_model": state["overview_meta"].get("model"),
-                    "analysis_model": state["critique_meta"].get("model"),
-                    "requested_analysis_model": state["critique_meta"].get("requested_model"),
-                    "analysis_fallback_used": state["critique_meta"].get("fallback_used", False),
-                    "sections": len(state.get("section_targets") or []),
-                    "paper_char_count": state["paper_text_meta"].get("char_count"),
-                    "web_search_enabled": state.get("web_search_enabled", False),
-                    "web_sources": len((state.get("web_research") or {}).get("source_shortlist", [])),
-                    "resource_repositories": len((state.get("resource_discovery") or {}).get("code_repositories", [])),
-                },
+                summary,
             )
-            self._stage_finish(state, stage, report_path=run_dir / "final_report.md")
-            return {"report_markdown": report_markdown}
+            self._stage_finish(
+                state,
+                stage,
+                report_path=run_dir / "final_report.md",
+                html_report_path=run_dir / "final_report.html",
+                pdf_report_path=run_dir / "final_report.pdf",
+            )
+            return {"report_markdown": report_markdown, "report_exports": report_exports}
         except Exception as exc:
             self._stage_error(state, stage, exc)
             raise

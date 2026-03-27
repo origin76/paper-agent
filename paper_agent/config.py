@@ -65,6 +65,11 @@ class RuntimeConfig:
     paper_context_max_chars: int
     section_target_chars: int
     pdf_extract_timeout_seconds: int
+    url_content_enrichment_enabled: bool
+    url_content_enrichment_max_urls: int
+    url_fetch_timeout_seconds: int
+    url_fetch_max_bytes: int
+    url_fetch_max_text_chars: int
     output_root: Path
 
     @classmethod
@@ -110,6 +115,11 @@ class RuntimeConfig:
             paper_context_max_chars=_parse_int(os.getenv("PAPER_AGENT_PAPER_CONTEXT_MAX_CHARS"), 180000),
             section_target_chars=_parse_int(os.getenv("PAPER_AGENT_SECTION_TARGET_CHARS"), 24000),
             pdf_extract_timeout_seconds=_parse_int(os.getenv("PAPER_AGENT_PDF_EXTRACT_TIMEOUT_SECONDS"), 60),
+            url_content_enrichment_enabled=_parse_bool(os.getenv("PAPER_AGENT_URL_CONTENT_ENRICHMENT_ENABLED"), True),
+            url_content_enrichment_max_urls=_parse_int(os.getenv("PAPER_AGENT_URL_CONTENT_ENRICHMENT_MAX_URLS"), 8),
+            url_fetch_timeout_seconds=_parse_int(os.getenv("PAPER_AGENT_URL_FETCH_TIMEOUT_SECONDS"), 12),
+            url_fetch_max_bytes=_parse_int(os.getenv("PAPER_AGENT_URL_FETCH_MAX_BYTES"), 600000),
+            url_fetch_max_text_chars=_parse_int(os.getenv("PAPER_AGENT_URL_FETCH_MAX_TEXT_CHARS"), 6000),
             output_root=output_root,
         )
 
