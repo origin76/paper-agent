@@ -44,6 +44,13 @@ Stages:
 10. `extensions`
 11. `render_report`
 
+Parallelism notes:
+
+- `structure_breakdown` now starts immediately after `global_overview`, in parallel with the web research chain.
+- `section_deep_dive` and `experiment_review` now start as soon as both `structure_breakdown` and `url_resource_enrichment` are ready, and they run in parallel.
+- Inside `section_deep_dive`, multiple section-level LLM calls can run concurrently via `PAPER_AGENT_SECTION_MAX_WORKERS`.
+- Inside `url_resource_enrichment`, fetched-page analysis and search-based weak fallback can run concurrently when both are needed.
+
 ## Requirements
 
 - Python 3.12+
@@ -113,7 +120,7 @@ Optional:
 - `PAPER_AGENT_MAX_SECTIONS`
   - default: `8`
 - `PAPER_AGENT_SECTION_MAX_WORKERS`
-  - default: `1`
+  - default: `4`
 - `PAPER_AGENT_ANALYSIS_ENABLE_THINKING`
   - default: `true`
 - `PAPER_AGENT_LOG_LEVEL`

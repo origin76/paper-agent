@@ -7,9 +7,144 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from paper_agent.runtime import log_event
+
 
 _LIST_ITEM_PATTERN = re.compile(r"^(\s*)([-*]|\d+\.)\s+(.*)$")
 _HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.*)$")
+_INLINE_MATH_PATTERN = re.compile(r"(?<!\\)\$(.+?)(?<!\\)\$")
+_PAREN_MATH_PATTERN = re.compile(r"\\\((.+?)\\\)")
+_BRACKET_MATH_PATTERN = re.compile(r"\\\[(.+?)\\\]", re.DOTALL)
+_LATEX_WRAPPER_PATTERN = re.compile(
+    r"\\(?:text|mathrm|operatorname|mathit|mathbf|mathsf|textbf|textit)\{([^{}]+)\}"
+)
+_LATEX_MATHBB_PATTERN = re.compile(r"\\mathbb\{([^{}]+)\}")
+_LATEX_SQRT_PATTERN = re.compile(r"\\sqrt\{([^{}]+)\}")
+_LATEX_FRAC_PATTERN = re.compile(r"\\frac\{([^{}]+)\}\{([^{}]+)\}")
+_LATEX_COMMAND_PATTERN = re.compile(r"\\[A-Za-z]+")
+_BOLD_PATTERN = re.compile(r"(?<!\*)\*\*(?=\S)(.+?)(?<=\S)\*\*(?!\*)")
+_ITALIC_PATTERN = re.compile(r"(?<![\w\u4e00-\u9fff])\*(?=\S)(.+?)(?<=\S)\*(?![\w\u4e00-\u9fff])")
+_SUPERSCRIPT_PATTERN = re.compile(r"\^\{([^{}]+)\}|\^([A-Za-z0-9+\-=]+)")
+_SUBSCRIPT_PATTERN = re.compile(r"_\{([^{}]+)\}|_([0-9+\-=]+)")
+
+_LATEX_REPLACEMENTS = {
+    r"\argmax": "argmax",
+    r"\argmin": "argmin",
+    r"\varepsilon": "ε",
+    r"\epsilon": "ε",
+    r"\lambda": "λ",
+    r"\theta": "θ",
+    r"\sigma": "σ",
+    r"\alpha": "α",
+    r"\gamma": "γ",
+    r"\delta": "δ",
+    r"\beta": "β",
+    r"\omega": "ω",
+    r"\Omega": "Ω",
+    r"\Theta": "Θ",
+    r"\Lambda": "Λ",
+    r"\Delta": "Δ",
+    r"\Phi": "Φ",
+    r"\Pi": "Π",
+    r"\mu": "μ",
+    r"\rho": "ρ",
+    r"\pi": "π",
+    r"\cdots": "⋯",
+    r"\ldots": "…",
+    r"\dots": "…",
+    r"\cdot": "·",
+    r"\times": "×",
+    r"\pm": "±",
+    r"\neq": "≠",
+    r"\ne": "≠",
+    r"\leq": "≤",
+    r"\le": "≤",
+    r"\geq": "≥",
+    r"\ge": "≥",
+    r"\approx": "≈",
+    r"\infty": "∞",
+    r"\forall": "∀",
+    r"\exists": "∃",
+    r"\subseteq": "⊆",
+    r"\subset": "⊂",
+    r"\supseteq": "⊇",
+    r"\cup": "∪",
+    r"\cap": "∩",
+    r"\notin": "∉",
+    r"\in": "∈",
+    r"\mapsto": "↦",
+    r"\rightarrow": "→",
+    r"\to": "→",
+    r"\langle": "<",
+    r"\rangle": ">",
+    r"\lVert": "||",
+    r"\rVert": "||",
+    r"\Vert": "||",
+    r"\|": "||",
+    r"\log": "log",
+    r"\ln": "ln",
+    r"\exp": "exp",
+    r"\min": "min",
+    r"\max": "max",
+    r"\sum": "Σ",
+    r"\prod": "Π",
+    r"\quad": " ",
+    r"\qquad": " ",
+    r"\{": "{",
+    r"\}": "}",
+}
+
+_UNICODE_SUPERSCRIPTS = str.maketrans(
+    {
+        "0": "⁰",
+        "1": "¹",
+        "2": "²",
+        "3": "³",
+        "4": "⁴",
+        "5": "⁵",
+        "6": "⁶",
+        "7": "⁷",
+        "8": "⁸",
+        "9": "⁹",
+        "+": "⁺",
+        "-": "⁻",
+        "=": "⁼",
+        "(": "⁽",
+        ")": "⁾",
+        "n": "ⁿ",
+        "i": "ⁱ",
+    }
+)
+
+_UNICODE_SUBSCRIPTS = str.maketrans(
+    {
+        "0": "₀",
+        "1": "₁",
+        "2": "₂",
+        "3": "₃",
+        "4": "₄",
+        "5": "₅",
+        "6": "₆",
+        "7": "₇",
+        "8": "₈",
+        "9": "₉",
+        "+": "₊",
+        "-": "₋",
+        "=": "₌",
+        "(": "₍",
+        ")": "₎",
+    }
+)
+
+_SUPPORTED_SUPERSCRIPT_CHARS = set("0123456789+-=()ni")
+_SUPPORTED_SUBSCRIPT_CHARS = set("0123456789+-=()")
+
+_PDF_FONT_CANDIDATES = (
+    ("ArialUnicodeMS", Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf")),
+    ("ArialUnicodeMSLocal", Path("/Library/Fonts/Arial Unicode.ttf")),
+    ("SongtiSC", Path("/System/Library/Fonts/Supplemental/Songti.ttc")),
+    ("STHeitiLight", Path("/System/Library/Fonts/STHeiti Light.ttc")),
+)
 
 
 @dataclass(slots=True)
@@ -59,6 +194,15 @@ class ReportDocument:
     headings: list[HeadingBlock]
 
 
+@dataclass(frozen=True, slots=True)
+class PdfFontSelection:
+    font_name: str
+    font_path: str | None
+    strategy: str
+    embedded: bool
+    failures: tuple[str, ...] = ()
+
+
 def build_report_document(markdown_text: str, title: str | None = None) -> ReportDocument:
     blocks = _parse_markdown(markdown_text)
     headings = [block for block in blocks if isinstance(block, HeadingBlock)]
@@ -72,6 +216,14 @@ def export_html_report(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output = Path(output_path)
+    diagnostics = _collect_document_export_diagnostics(document)
+    log_event(
+        "info",
+        "Report HTML export normalization prepared",
+        output_path=output,
+        inline_math_expressions=diagnostics["inline_math_expressions"],
+        latex_commands=diagnostics["latex_commands"],
+    )
     html_text = _render_html_document(document, metadata=metadata)
     output.write_text(html_text, encoding="utf-8")
     return {
@@ -92,13 +244,24 @@ def export_pdf_report(
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
-    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-    from reportlab.pdfbase.pdfmetrics import registerFont
     from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
     output = Path(output_path)
-    cjk_font_name = "STSong-Light"
-    registerFont(UnicodeCIDFont(cjk_font_name))
+    diagnostics = _collect_document_export_diagnostics(document)
+    font_selection = _select_pdf_font()
+    cjk_font_name = font_selection.font_name
+    log_event(
+        "info",
+        "Report PDF export font prepared",
+        output_path=output,
+        font_name=font_selection.font_name,
+        font_path=font_selection.font_path,
+        font_strategy=font_selection.strategy,
+        embedded=font_selection.embedded,
+        inline_math_expressions=diagnostics["inline_math_expressions"],
+        latex_commands=diagnostics["latex_commands"],
+        font_failures=" | ".join(font_selection.failures) if font_selection.failures else None,
+    )
 
     styles = getSampleStyleSheet()
     base_style = ParagraphStyle(
@@ -800,7 +963,8 @@ def _format_inline_for_pdf(text: str) -> str:
 
 def _format_inline(text: str, mode: str) -> str:
     placeholders: dict[str, str] = {}
-    escaped = html.escape(text, quote=False)
+    normalized = _normalize_math_markup(text)
+    escaped = html.escape(normalized, quote=False)
 
     def stash(rendered: str) -> str:
         token = f"__MARKUP_{len(placeholders)}__"
@@ -830,8 +994,8 @@ def _format_inline(text: str, mode: str) -> str:
         lambda match: stash(render_code(match.group(1))),
         escaped,
     )
-    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>" if mode == "html" else r"<b>\1</b>", escaped)
-    escaped = re.sub(r"\*([^*]+)\*", r"<em>\1</em>" if mode == "html" else r"<i>\1</i>", escaped)
+    escaped = _BOLD_PATTERN.sub(r"<strong>\1</strong>" if mode == "html" else r"<b>\1</b>", escaped)
+    escaped = _ITALIC_PATTERN.sub(r"<em>\1</em>" if mode == "html" else r"<i>\1</i>", escaped)
     escaped = re.sub(
         r"(?<![\"=/])(https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)",
         lambda match: stash(render_link(match.group(1), match.group(1))),
@@ -848,6 +1012,183 @@ def _format_code_block_for_pdf(text: str) -> str:
     safe_text = html.escape(text, quote=False)
     safe_text = safe_text.replace(" ", "&nbsp;").replace("\t", "&nbsp;" * 4).replace("\n", "<br/>")
     return safe_text
+
+
+def _collect_document_export_diagnostics(document: ReportDocument) -> dict[str, int]:
+    parts: list[str] = [document.title]
+    for block in document.blocks:
+        if isinstance(block, (HeadingBlock, ParagraphBlock, QuoteBlock, CodeBlock)):
+            parts.append(block.text)
+        elif isinstance(block, ListBlock):
+            parts.extend(_flatten_list_items(block.items))
+    joined = "\n".join(parts)
+    return {
+        "inline_math_expressions": (
+            len(_INLINE_MATH_PATTERN.findall(joined))
+            + len(_PAREN_MATH_PATTERN.findall(joined))
+            + len(_BRACKET_MATH_PATTERN.findall(joined))
+        ),
+        "latex_commands": len(_LATEX_COMMAND_PATTERN.findall(joined)),
+    }
+
+
+def _flatten_list_items(items: list[ListItemNode]) -> list[str]:
+    values: list[str] = []
+    for item in items:
+        values.append(item.text)
+        if item.children:
+            values.extend(_flatten_list_items(item.children))
+    return values
+
+
+def _select_pdf_font() -> PdfFontSelection:
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfbase.pdfmetrics import getRegisteredFontNames, registerFont
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    registered_fonts = set(getRegisteredFontNames())
+    failures: list[str] = []
+
+    for font_name, font_path in _PDF_FONT_CANDIDATES:
+        if not font_path.exists():
+            continue
+        try:
+            if font_name not in registered_fonts:
+                registerFont(TTFont(font_name, str(font_path)))
+            return PdfFontSelection(
+                font_name=font_name,
+                font_path=str(font_path),
+                strategy="embedded_truetype",
+                embedded=True,
+                failures=tuple(failures),
+            )
+        except Exception as exc:  # pragma: no cover - depends on local fonts
+            failures.append(f"{font_name}:{font_path}:{type(exc).__name__}:{exc}")
+
+    fallback_name = "STSong-Light"
+    if fallback_name not in registered_fonts:
+        registerFont(UnicodeCIDFont(fallback_name))
+    return PdfFontSelection(
+        font_name=fallback_name,
+        font_path=None,
+        strategy="cid_fallback",
+        embedded=False,
+        failures=tuple(failures),
+    )
+
+
+def _normalize_math_markup(text: str) -> str:
+    if not text or ("$" not in text and "\\" not in text):
+        return text
+
+    normalized = text
+    for pattern in (_BRACKET_MATH_PATTERN, _PAREN_MATH_PATTERN, _INLINE_MATH_PATTERN):
+        normalized = pattern.sub(lambda match: _normalize_math_expression(match.group(1)), normalized)
+    normalized = _apply_latex_replacements(normalized)
+    normalized = normalized.replace(r"\$", "$")
+    return normalized
+
+
+def _normalize_math_expression(expression: str) -> str:
+    normalized = expression.strip().replace("\n", " ")
+    normalized = re.sub(r"\\(?:left|right|bigl|bigr|Bigl|Bigr|big|Big)\b", "", normalized)
+
+    while True:
+        updated = normalized
+        updated = _LATEX_WRAPPER_PATTERN.sub(lambda match: _normalize_math_expression(match.group(1)), updated)
+        updated = _LATEX_MATHBB_PATTERN.sub(lambda match: _render_mathbb(match.group(1)), updated)
+        updated = _LATEX_SQRT_PATTERN.sub(lambda match: _render_sqrt(match.group(1)), updated)
+        updated = _LATEX_FRAC_PATTERN.sub(lambda match: _render_fraction(match.group(1), match.group(2)), updated)
+        if updated == normalized:
+            break
+        normalized = updated
+
+    normalized = _apply_latex_replacements(normalized)
+    normalized = re.sub(r"\\([A-Za-z]+)", r"\1", normalized)
+    normalized = _SUPERSCRIPT_PATTERN.sub(_replace_superscript, normalized)
+    normalized = _SUBSCRIPT_PATTERN.sub(_replace_subscript, normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"\s*([=≤≥≈→↦])\s*", r" \1 ", normalized)
+    normalized = re.sub(r"\s*([,:;])\s*", r"\1 ", normalized)
+    normalized = re.sub(r"<\s*([^<>]*?,[^<>]*?)\s*>", r"<\1>", normalized)
+    normalized = re.sub(r"\s+([)\]⟩])", r"\1", normalized)
+    normalized = re.sub(r"([(\[⟨])\s+", r"\1", normalized)
+    return normalized.strip()
+
+
+def _apply_latex_replacements(text: str) -> str:
+    normalized = text.replace("~", " ").replace(r"\\", " ")
+    for source in sorted(_LATEX_REPLACEMENTS, key=len, reverse=True):
+        normalized = normalized.replace(source, _LATEX_REPLACEMENTS[source])
+    normalized = re.sub(r"\\mathcal\{([^{}]+)\}", r"\1", normalized)
+    normalized = re.sub(r"\\operatorname\{([^{}]+)\}", r"\1", normalized)
+    return normalized
+
+
+def _render_mathbb(token: str) -> str:
+    known = {
+        "R": "ℝ",
+        "N": "ℕ",
+        "Z": "ℤ",
+        "Q": "ℚ",
+        "C": "ℂ",
+    }
+    return known.get(token, token)
+
+
+def _render_sqrt(token: str) -> str:
+    inner = _normalize_math_expression(token)
+    if _is_simple_math_atom(inner):
+        return f"√{inner}"
+    return f"√({inner})"
+
+
+def _render_fraction(numerator: str, denominator: str) -> str:
+    left = _normalize_math_expression(numerator)
+    right = _normalize_math_expression(denominator)
+    if _needs_parentheses(left):
+        left = f"({left})"
+    if _needs_parentheses(right):
+        right = f"({right})"
+    return f"{left}/{right}"
+
+
+def _replace_superscript(match: re.Match[str]) -> str:
+    token = match.group(1) or match.group(2) or ""
+    rendered = _translate_script(token, script="superscript")
+    if rendered is not None:
+        return rendered
+    if match.group(1) is not None:
+        return f"^({token})"
+    return f"^{token}"
+
+
+def _replace_subscript(match: re.Match[str]) -> str:
+    token = match.group(1) or match.group(2) or ""
+    rendered = _translate_script(token, script="subscript")
+    if rendered is not None:
+        return rendered
+    if match.group(1) is not None:
+        return f"_({token})"
+    return f"_{token}"
+
+
+def _translate_script(token: str, script: str) -> str | None:
+    translation = _UNICODE_SUPERSCRIPTS if script == "superscript" else _UNICODE_SUBSCRIPTS
+    supported = _SUPPORTED_SUPERSCRIPT_CHARS if script == "superscript" else _SUPPORTED_SUBSCRIPT_CHARS
+    if not token or any(character not in supported for character in token):
+        return None
+    return token.translate(translation)
+
+
+def _needs_parentheses(text: str) -> bool:
+    if text.startswith("(") and text.endswith(")"):
+        return False
+    return any(character in text for character in (" ", "+", "-", "=", "≤", "≥", "≈"))
+
+
+def _is_simple_math_atom(text: str) -> bool:
+    return bool(re.fullmatch(r"[\w\u0370-\u03ff∞πλμσθαβγδΩΘΦΠ₀-₉⁰-⁹.+\-]+", text))
 
 
 def _unique_anchor(text: str, heading_counts: dict[str, int]) -> str:

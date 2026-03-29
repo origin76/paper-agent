@@ -110,7 +110,7 @@ class RuntimeConfig:
             max_output_tokens=_parse_int(os.getenv("PAPER_AGENT_MAX_OUTPUT_TOKENS"), 4096),
             request_timeout_seconds=_parse_int(os.getenv("PAPER_AGENT_TIMEOUT_SECONDS"), 180),
             max_sections=_parse_int(os.getenv("PAPER_AGENT_MAX_SECTIONS"), 8),
-            section_max_workers=_parse_int(os.getenv("PAPER_AGENT_SECTION_MAX_WORKERS"), 1),
+            section_max_workers=_parse_int(os.getenv("PAPER_AGENT_SECTION_MAX_WORKERS"), 4),
             analysis_enable_thinking=_parse_bool(os.getenv("PAPER_AGENT_ANALYSIS_ENABLE_THINKING"), True),
             paper_context_max_chars=_parse_int(os.getenv("PAPER_AGENT_PAPER_CONTEXT_MAX_CHARS"), 180000),
             section_target_chars=_parse_int(os.getenv("PAPER_AGENT_SECTION_TARGET_CHARS"), 24000),

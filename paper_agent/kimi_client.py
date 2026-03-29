@@ -104,12 +104,18 @@ class KimiClient:
         stage: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         log_event("warning", "LLM JSON parse failed, attempting repair", stage=stage, model=model)
+        repair_chain: list[dict[str, Any]] = []
+
         response = self.client.chat.completions.create(
             model=model,
             messages=[
                 {
                     "role": "system",
-                    "content": "You repair malformed JSON. Return only one valid JSON object. Keep the original meaning. Use Simplified Chinese string values when possible.",
+                    "content": (
+                        "You repair malformed JSON. Return only one valid JSON object. "
+                        "Keep the original meaning, but you may shorten verbose string values if needed "
+                        "to guarantee valid JSON. Use Simplified Chinese string values when possible."
+                    ),
                 },
                 {
                     "role": "user",
@@ -123,10 +129,66 @@ class KimiClient:
             extra_body=self._build_extra_body(False, False),
         )
         repaired_content = response.choices[0].message.content or "{}"
-        payload = extract_json_object(repaired_content)
+        repair_chain.append(
+            {
+                "attempt": 1,
+                "response_id": getattr(response, "id", None),
+                "usage": _usage_to_dict(getattr(response, "usage", None)),
+            }
+        )
+        try:
+            payload = extract_json_object(repaired_content)
+        except Exception as exc:
+            log_event(
+                "warning",
+                "LLM JSON repair parse failed, attempting strict repair",
+                stage=stage,
+                model=model,
+                error=str(exc),
+            )
+            strict_response = self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a strict JSON repair engine. "
+                            "Return only one syntactically valid JSON object. "
+                            "No prose, no markdown, no comments. "
+                            "Escape all embedded quotes inside string values. "
+                            "If the source is incomplete, infer the shortest valid completion that preserves the schema."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "第一次修复后的 JSON 仍然无法解析。"
+                            "请基于原始损坏内容和第一次修复结果，再严格修复一次，只输出 JSON 本体。\n\n"
+                            f"原始内容：\n{raw_content}\n\n第一次修复结果：\n{repaired_content}"
+                        ),
+                    },
+                ],
+                temperature=0,
+                max_tokens=self.config.max_output_tokens,
+                timeout=self.config.request_timeout_seconds,
+                response_format={"type": "json_object"},
+                extra_body=self._build_extra_body(False, False),
+            )
+            repaired_content = strict_response.choices[0].message.content or "{}"
+            repair_chain.append(
+                {
+                    "attempt": 2,
+                    "response_id": getattr(strict_response, "id", None),
+                    "usage": _usage_to_dict(getattr(strict_response, "usage", None)),
+                }
+            )
+            payload = extract_json_object(repaired_content)
+
         meta = {
-            "response_id": getattr(response, "id", None),
-            "usage": _usage_to_dict(getattr(response, "usage", None)),
+            "response_id": repair_chain[-1]["response_id"],
+            "usage": repair_chain[-1]["usage"],
+            "repair_attempts": len(repair_chain),
+            "repair_chain": repair_chain,
         }
         log_event(
             "info",
@@ -135,6 +197,7 @@ class KimiClient:
             model=model,
             response_id=meta["response_id"],
             total_tokens=meta["usage"].get("total_tokens"),
+            repair_attempts=meta["repair_attempts"],
         )
         return payload, meta
 

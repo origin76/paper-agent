@@ -139,7 +139,7 @@ def collect_resource_url_candidates(
                 if not isinstance(item, dict):
                     continue
                 url = str(item.get("url") or "").strip()
-                if not url:
+                if not url or not _looks_like_web_url(url):
                     continue
                 candidate = by_url.setdefault(
                     url,
@@ -157,6 +157,11 @@ def collect_resource_url_candidates(
                     candidate["locations"].append(location)
 
     return list(by_url.values())[:limit]
+
+
+def _looks_like_web_url(value: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized.startswith("http://") or normalized.startswith("https://")
 
 
 def fetch_url_context(url: str, timeout_seconds: int = 12, max_bytes: int = 600_000, max_text_chars: int = 6000) -> dict[str, Any]:

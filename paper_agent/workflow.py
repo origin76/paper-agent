@@ -61,6 +61,7 @@ class PaperState(TypedDict, total=False):
     url_resource_contexts: list[dict[str, Any]]
     url_resource_enrichment: dict[str, Any]
     url_resource_enrichment_meta: dict[str, Any]
+    deep_analysis_ready: bool
     structure: dict[str, Any]
     structure_meta: dict[str, Any]
     section_targets: list[str]
@@ -69,6 +70,7 @@ class PaperState(TypedDict, total=False):
     section_analyses_meta: list[dict[str, Any]]
     experiment_review: dict[str, Any]
     experiment_review_meta: dict[str, Any]
+    synthesis_ready: bool
     critique: str
     critique_meta: dict[str, Any]
     extensions: str
@@ -92,8 +94,10 @@ class PaperAnalysisWorkflow:
         graph.add_node("resource_discovery", self.resource_discovery)
         graph.add_node("url_resource_enrichment", self.url_resource_enrichment)
         graph.add_node("structure_breakdown", self.structure_breakdown)
+        graph.add_node("wait_for_deep_analysis_inputs", self.wait_for_deep_analysis_inputs)
         graph.add_node("section_deep_dive", self.section_deep_dive)
         graph.add_node("experiment_review", self.experiment_review)
+        graph.add_node("wait_for_synthesis_inputs", self.wait_for_synthesis_inputs)
         graph.add_node("critique", self.critique)
         graph.add_node("extensions", self.extensions)
         graph.add_node("render_report", self.render_report_node)
@@ -102,12 +106,15 @@ class PaperAnalysisWorkflow:
         graph.add_edge(START, "ingest_pdf")
         graph.add_edge("ingest_pdf", "global_overview")
         graph.add_edge("global_overview", "web_research")
+        graph.add_edge("global_overview", "structure_breakdown")
         graph.add_edge("web_research", "resource_discovery")
         graph.add_edge("resource_discovery", "url_resource_enrichment")
-        graph.add_edge("url_resource_enrichment", "structure_breakdown")
-        graph.add_edge("structure_breakdown", "section_deep_dive")
-        graph.add_edge("section_deep_dive", "experiment_review")
-        graph.add_edge("experiment_review", "critique")
+        graph.add_edge("url_resource_enrichment", "wait_for_deep_analysis_inputs")
+        graph.add_edge("structure_breakdown", "wait_for_deep_analysis_inputs")
+        graph.add_edge("section_deep_dive", "wait_for_synthesis_inputs")
+        graph.add_edge("experiment_review", "wait_for_synthesis_inputs")
+        graph.add_conditional_edges("wait_for_deep_analysis_inputs", self.route_after_deep_analysis_wait)
+        graph.add_conditional_edges("wait_for_synthesis_inputs", self.route_after_synthesis_wait)
         graph.add_edge("critique", "extensions")
         graph.add_edge("extensions", "render_report")
         graph.add_edge("render_report", "cleanup_remote_file")
@@ -710,6 +717,50 @@ class PaperAnalysisWorkflow:
                 "resource_discovery_meta": {"enabled": False, "error": str(exc)},
             }
 
+    def _analyze_url_resource_pages(
+        self,
+        stage: str,
+        prompt_contexts: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        client = KimiClient(self.config)
+        return client.chat_json(
+            messages=[
+                {"role": "system", "content": BASE_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": build_url_resource_enrichment_prompt(prompt_contexts),
+                },
+            ],
+            model=self.config.document_model,
+            enable_thinking=False,
+            enable_search=False,
+            stage=f"{stage}.analyze",
+        )
+
+    def _analyze_url_resource_search_fallback(
+        self,
+        stage: str,
+        overview: dict[str, Any],
+        fallback_prompt_contexts: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        client = KimiClient(self.config)
+        return client.chat_json(
+            messages=[
+                {"role": "system", "content": BASE_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": build_url_resource_search_fallback_prompt(
+                        overview,
+                        fallback_prompt_contexts,
+                    ),
+                },
+            ],
+            model=self.config.document_model,
+            enable_thinking=False,
+            enable_search=True,
+            stage=f"{stage}.search_fallback",
+        )
+
     def url_resource_enrichment(self, state: PaperState) -> PaperState:
         stage = "url_resource_enrichment"
         run_dir = Path(state["run_dir"])
@@ -729,6 +780,8 @@ class PaperAnalysisWorkflow:
         fetch_failures: list[dict[str, Any]] = []
         analyzed_payload: dict[str, Any] = {"pages": [], "search_fallback_pages": []}
         analyzed_pages: dict[str, dict[str, Any]] = {}
+        analysis_meta: dict[str, Any] = {"enabled": False, "reason": "not_started"}
+        search_fallback_meta: dict[str, Any] = {"enabled": False, "reason": "not_started"}
 
         try:
             if self.config.url_content_enrichment_enabled and candidates:
@@ -764,49 +817,79 @@ class PaperAnalysisWorkflow:
 
                 fetched_contexts.sort(key=lambda item: str(item.get("url") or ""))
                 prompt_contexts = build_enrichment_contexts_for_prompt(candidates, fetched_contexts)
+                fallback_prompt_contexts = build_failed_page_contexts_for_prompt(candidates, fetch_failures) if fetch_failures else []
+                llm_jobs: list[str] = []
                 if prompt_contexts:
-                    analyzed_payload, analysis_meta = self.client.chat_json(
-                        messages=[
-                            {"role": "system", "content": BASE_SYSTEM_PROMPT},
-                            {
-                                "role": "user",
-                                "content": build_url_resource_enrichment_prompt(prompt_contexts),
-                            },
-                        ],
-                        model=self.config.document_model,
-                        enable_thinking=False,
-                        enable_search=False,
-                        stage=f"{stage}.analyze",
-                    )
-                    analyzed_pages = build_analysis_map(analyzed_payload)
+                    llm_jobs.append("analyze")
                 else:
                     analysis_meta = {"enabled": False, "reason": "no_fetch_success"}
-
-                if fetch_failures:
-                    fallback_prompt_contexts = build_failed_page_contexts_for_prompt(candidates, fetch_failures)
-                    if fallback_prompt_contexts:
-                        fallback_pages_payload, search_fallback_meta = self.client.chat_json(
-                            messages=[
-                                {"role": "system", "content": BASE_SYSTEM_PROMPT},
-                                {
-                                    "role": "user",
-                                    "content": build_url_resource_search_fallback_prompt(
-                                        state["overview"],
-                                        fallback_prompt_contexts,
-                                    ),
-                                },
-                            ],
-                            model=self.config.document_model,
-                            enable_thinking=False,
-                            enable_search=True,
-                            stage=f"{stage}.search_fallback",
-                        )
-                        analyzed_payload["search_fallback_pages"] = fallback_pages_payload.get("pages", [])
-                        analyzed_pages = build_analysis_map(analyzed_payload)
-                    else:
-                        search_fallback_meta = {"enabled": False, "reason": "no_failed_candidates"}
+                if fallback_prompt_contexts:
+                    llm_jobs.append("search_fallback")
                 else:
-                    search_fallback_meta = {"enabled": False, "reason": "no_fetch_failures"}
+                    search_fallback_meta = {"enabled": False, "reason": "no_fetch_failures" if not fetch_failures else "no_failed_candidates"}
+
+                if llm_jobs:
+                    log_event(
+                        "info",
+                        "URL enrichment LLM jobs started",
+                        stage=stage,
+                        job_count=len(llm_jobs),
+                        jobs=llm_jobs,
+                    )
+                    if len(llm_jobs) == 2:
+                        with ThreadPoolExecutor(max_workers=2) as executor:
+                            future_map = {
+                                executor.submit(self._analyze_url_resource_pages, stage, prompt_contexts): "analyze",
+                                executor.submit(
+                                    self._analyze_url_resource_search_fallback,
+                                    stage,
+                                    state["overview"],
+                                    fallback_prompt_contexts,
+                                ): "search_fallback",
+                            }
+                            for future in as_completed(future_map):
+                                job_name = future_map[future]
+                                payload, meta = future.result()
+                                if job_name == "analyze":
+                                    analyzed_payload["pages"] = payload.get("pages", [])
+                                    analysis_meta = meta
+                                else:
+                                    analyzed_payload["search_fallback_pages"] = payload.get("pages", [])
+                                    search_fallback_meta = meta
+                                log_event(
+                                    "info",
+                                    "URL enrichment LLM job finished",
+                                    stage=stage,
+                                    job=job_name,
+                                    page_count=len(payload.get("pages") or []),
+                                )
+                    else:
+                        if prompt_contexts:
+                            page_payload, analysis_meta = self._analyze_url_resource_pages(stage, prompt_contexts)
+                            analyzed_payload["pages"] = page_payload.get("pages", [])
+                            log_event(
+                                "info",
+                                "URL enrichment LLM job finished",
+                                stage=stage,
+                                job="analyze",
+                                page_count=len(page_payload.get("pages") or []),
+                            )
+                        elif fallback_prompt_contexts:
+                            fallback_pages_payload, search_fallback_meta = self._analyze_url_resource_search_fallback(
+                                stage,
+                                state["overview"],
+                                fallback_prompt_contexts,
+                            )
+                            analyzed_payload["search_fallback_pages"] = fallback_pages_payload.get("pages", [])
+                            log_event(
+                                "info",
+                                "URL enrichment LLM job finished",
+                                stage=stage,
+                                job="search_fallback",
+                                page_count=len(fallback_pages_payload.get("pages") or []),
+                            )
+
+                    analyzed_pages = build_analysis_map(analyzed_payload)
             else:
                 analysis_meta = {
                     "enabled": False,
@@ -873,6 +956,27 @@ class PaperAnalysisWorkflow:
             )
             raise
 
+    def wait_for_deep_analysis_inputs(self, state: PaperState) -> PaperState:
+        stage = "wait_for_deep_analysis_inputs"
+        has_structure = state.get("structure") is not None
+        has_url_resource_enrichment = state.get("url_resource_enrichment_meta") is not None
+        ready = has_structure and has_url_resource_enrichment
+        self._stage_start(
+            state,
+            stage,
+            has_structure=has_structure,
+            has_url_resource_enrichment=has_url_resource_enrichment,
+        )
+        self._stage_finish(state, stage, ready=ready)
+        if not ready:
+            return {}
+        return {"deep_analysis_ready": True}
+
+    def route_after_deep_analysis_wait(self, state: PaperState) -> list[str]:
+        if state.get("deep_analysis_ready"):
+            return ["section_deep_dive", "experiment_review"]
+        return []
+
     def structure_breakdown(self, state: PaperState) -> PaperState:
         stage = "structure_breakdown"
         run_dir = Path(state["run_dir"])
@@ -904,6 +1008,27 @@ class PaperAnalysisWorkflow:
             self._stage_error(state, stage, exc)
             raise
 
+    def wait_for_synthesis_inputs(self, state: PaperState) -> PaperState:
+        stage = "wait_for_synthesis_inputs"
+        has_section_analyses = state.get("section_analyses") is not None
+        has_experiment_review = state.get("experiment_review") is not None
+        ready = has_section_analyses and has_experiment_review
+        self._stage_start(
+            state,
+            stage,
+            has_section_analyses=has_section_analyses,
+            has_experiment_review=has_experiment_review,
+        )
+        self._stage_finish(state, stage, ready=ready)
+        if not ready:
+            return {}
+        return {"synthesis_ready": True}
+
+    def route_after_synthesis_wait(self, state: PaperState) -> list[str]:
+        if state.get("synthesis_ready"):
+            return ["critique"]
+        return []
+
     def _analyze_single_section(
         self,
         section: dict[str, Any],
@@ -933,7 +1058,13 @@ class PaperAnalysisWorkflow:
         section_analyses: list[dict[str, Any]] = []
         section_meta: list[dict[str, Any]] = []
         selected_sections = state.get("selected_sections") or []
-        self._stage_start(state, stage, section_count=len(selected_sections))
+        self._stage_start(
+            state,
+            stage,
+            section_count=len(selected_sections),
+            max_workers=self.config.section_max_workers,
+            parallel_enabled=self.config.section_max_workers > 1 and len(selected_sections) > 1,
+        )
 
         try:
             if self.config.section_max_workers > 1 and len(selected_sections) > 1:
@@ -1092,6 +1223,7 @@ class PaperAnalysisWorkflow:
                 "web_search_enabled": state.get("web_search_enabled", False),
                 "web_sources": len((state.get("web_research") or {}).get("source_shortlist", [])),
                 "resource_repositories": len((state.get("resource_discovery") or {}).get("code_repositories", [])),
+                "section_max_workers": self.config.section_max_workers,
                 "url_content_enrichment_enabled": self.config.url_content_enrichment_enabled,
                 "url_content_enrichment_candidates": (state.get("url_resource_enrichment_meta") or {}).get("candidate_count"),
                 "url_content_fetched_pages": (state.get("url_resource_enrichment_meta") or {}).get("fetched_count"),
