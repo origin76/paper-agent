@@ -27,7 +27,7 @@ from paper_agent.prompts import (
 )
 from paper_agent.report import render_report
 from paper_agent.runtime import append_stage_trace, configure_logging, log_event
-from paper_agent.sections import detect_sections, select_experiment_sections
+from paper_agent.sections import clean_section_title, detect_sections, select_experiment_sections
 from paper_agent.url_enrichment import (
     apply_resource_url_enrichment,
     build_analysis_map,
@@ -291,7 +291,8 @@ class PaperAnalysisWorkflow:
         return trim_balanced_text(state["paper_text"], self.config.paper_context_max_chars)
 
     def _normalize_section_name(self, title: str) -> str:
-        normalized = re.sub(r"^\d+(\.\d+)*\s*", "", title.strip().lower())
+        cleaned_title = clean_section_title(title) or title
+        normalized = re.sub(r"^\d+(\.\d+)*\s*", "", cleaned_title.strip().lower())
         normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
         return re.sub(r"\s+", " ", normalized).strip()
 
@@ -400,6 +401,7 @@ class PaperAnalysisWorkflow:
         title = str(section.get("title", "")).strip()
         lowered = title.lower()
         score = 0
+        title_quality = int(section.get("title_quality", 0))
 
         if "front matter" in lowered:
             score -= 10
@@ -407,6 +409,11 @@ class PaperAnalysisWorkflow:
             score -= 2
         if "+" in title:
             score -= 1
+        score += title_quality
+        if title_quality < 0:
+            score -= 4
+        elif title_quality >= 5:
+            score += 2
 
         high_value_keywords = (
             "abstract",
@@ -1206,14 +1213,16 @@ class PaperAnalysisWorkflow:
         self._stage_start(state, stage)
         try:
             report_markdown = render_report(state)
+            report_title = state["overview"].get("paper_title") or state["source_name"]
             report_document = build_report_document(
                 report_markdown,
-                title=state["overview"].get("paper_title") or state["source_name"],
+                title=report_title,
             )
             write_text(run_dir / "final_report.md", report_markdown)
             summary = {
                 "pdf_path": state["pdf_path"],
                 "run_dir": state["run_dir"],
+                "paper_title": report_title,
                 "document_model": state["overview_meta"].get("model"),
                 "analysis_model": state["critique_meta"].get("model"),
                 "requested_analysis_model": state["critique_meta"].get("requested_model"),

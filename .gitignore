@@ -5,3 +5,7 @@ __pycache__/
 *.egg-info/
 runs/
 .env*
+zotero-paper-agent-final-pdfs/
+conference-papers/
+conference-parse-ready-final-pdfs/
+tests/

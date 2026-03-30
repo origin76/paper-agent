@@ -139,11 +139,27 @@ _UNICODE_SUBSCRIPTS = str.maketrans(
 _SUPPORTED_SUPERSCRIPT_CHARS = set("0123456789+-=()ni")
 _SUPPORTED_SUBSCRIPT_CHARS = set("0123456789+-=()")
 
-_PDF_FONT_CANDIDATES = (
-    ("ArialUnicodeMS", Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf")),
-    ("ArialUnicodeMSLocal", Path("/Library/Fonts/Arial Unicode.ttf")),
-    ("SongtiSC", Path("/System/Library/Fonts/Supplemental/Songti.ttc")),
-    ("STHeitiLight", Path("/System/Library/Fonts/STHeiti Light.ttc")),
+_PDF_FONT_SEARCH_LOCATIONS = (
+    Path.home() / "Library/Fonts",
+    Path("/Library/Fonts"),
+    Path("/System/Library/Fonts"),
+    Path("/System/Library/Fonts/Supplemental"),
+)
+
+_PDF_FONT_PATTERNS = (
+    ("MicrosoftYaHei", ("*Microsoft*YaHei*.ttf", "*Microsoft*YaHei*.ttc", "*YaHei*.ttf", "*YaHei*.ttc", "*微软雅黑*.ttf", "*微软雅黑*.ttc", "*msyh*.ttf", "*msyh*.ttc")),
+    ("DengXian", ("*DengXian*.ttf", "*DengXian*.ttc", "*等线*.ttf", "*等线*.ttc")),
+    ("PingFangSC", ("*PingFang*.ttf", "*PingFang*.ttc")),
+    ("HiraginoSansGB", ("*Hiragino Sans GB*.ttf", "*Hiragino Sans GB*.ttc", "*Hiragino*Sans*GB*.ttc")),
+    ("STHeiti", ("*STHeiti*.ttf", "*STHeiti*.ttc")),
+    ("ArialUnicodeMS", ("*Arial Unicode*.ttf",)),
+    ("SongtiSC", ("*Songti*.ttf", "*Songti*.ttc")),
+)
+
+_HTML_BODY_FONT_STACK = (
+    '"Microsoft YaHei", "微软雅黑", "DengXian", "等线", '
+    '"PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", '
+    '"Source Han Sans SC", "Helvetica Neue", Arial, sans-serif'
 )
 
 
@@ -588,7 +604,7 @@ def _render_html_document(document: ReportDocument, metadata: dict[str, Any] | N
           radial-gradient(circle at top left, rgba(15, 118, 110, 0.16), transparent 28%),
           radial-gradient(circle at top right, rgba(30, 64, 175, 0.12), transparent 30%),
           linear-gradient(180deg, #fbf7f1 0%, var(--bg) 52%, #efe7dc 100%);
-        font-family: "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "STSong", "Georgia", serif;
+        font-family: {_HTML_BODY_FONT_STACK};
         line-height: 1.82;
       }}
 
@@ -1041,6 +1057,26 @@ def _flatten_list_items(items: list[ListItemNode]) -> list[str]:
     return values
 
 
+def _iter_pdf_font_candidates() -> list[tuple[str, Path, int]]:
+    candidates: list[tuple[str, Path, int]] = []
+    seen_paths: set[str] = set()
+
+    for base_name, patterns in _PDF_FONT_PATTERNS:
+        for directory in _PDF_FONT_SEARCH_LOCATIONS:
+            if not directory.exists():
+                continue
+            for pattern in patterns:
+                for path in sorted(directory.glob(pattern)):
+                    if not path.is_file():
+                        continue
+                    resolved = str(path.resolve())
+                    if resolved in seen_paths:
+                        continue
+                    seen_paths.add(resolved)
+                    candidates.append((base_name, path, 0))
+    return candidates
+
+
 def _select_pdf_font() -> PdfFontSelection:
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
     from reportlab.pdfbase.pdfmetrics import getRegisteredFontNames, registerFont
@@ -1049,12 +1085,11 @@ def _select_pdf_font() -> PdfFontSelection:
     registered_fonts = set(getRegisteredFontNames())
     failures: list[str] = []
 
-    for font_name, font_path in _PDF_FONT_CANDIDATES:
-        if not font_path.exists():
-            continue
+    for base_name, font_path, subfont_index in _iter_pdf_font_candidates():
+        font_name = f"{base_name}-{font_path.stem.replace(' ', '_')}"
         try:
             if font_name not in registered_fonts:
-                registerFont(TTFont(font_name, str(font_path)))
+                registerFont(TTFont(font_name, str(font_path), subfontIndex=subfont_index))
             return PdfFontSelection(
                 font_name=font_name,
                 font_path=str(font_path),

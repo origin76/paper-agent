@@ -12,6 +12,7 @@ dependencies = [
   "langgraph>=0.2.60",
   "langchain-core>=0.3.0",
   "openai>=1.52.0",
+  "playwright>=1.53.0",
   "python-dotenv>=1.0.1",
   "reportlab>=4.4.0",
   "typing-extensions>=4.12.2",
@@ -19,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 paper-agent = "paper_agent.cli:main"
+paper-agent-fetch = "paper_agent.conference_fetch:main"
 
 [tool.setuptools]
 packages = ["paper_agent"]

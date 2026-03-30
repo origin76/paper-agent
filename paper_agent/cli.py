@@ -11,7 +11,7 @@ from typing import Any
 
 from paper_agent.config import RuntimeConfig
 from paper_agent.runtime import configure_logging, log_event
-from paper_agent.utils import slugify
+from paper_agent.utils import build_collected_pdf_name, extract_markdown_title, slugify, write_json
 from paper_agent.workflow import run_analysis
 
 
@@ -72,14 +72,62 @@ def _unique_output_name(base_name: str, used_names: set[str]) -> str:
         counter += 1
 
 
-def _collect_report_pdf(report_pdf_path: str | None, collect_dir: Path, source_pdf_path: str, used_names: set[str]) -> str | None:
+def _collection_index_path(collect_dir: Path) -> Path:
+    return collect_dir / "collection_index.json"
+
+
+def _load_collection_index(collect_dir: Path) -> dict[str, dict[str, Any]]:
+    index_path = _collection_index_path(collect_dir)
+    if not index_path.exists():
+        return {}
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(source_pdf_path): value
+        for source_pdf_path, value in payload.items()
+        if isinstance(value, dict)
+    }
+
+
+def _save_collection_index(collect_dir: Path, collection_index: dict[str, dict[str, Any]]) -> None:
+    write_json(_collection_index_path(collect_dir), collection_index)
+
+
+def _collect_report_pdf(
+    report_pdf_path: str | None,
+    collect_dir: Path,
+    source_pdf_path: str,
+    report_title: str | None,
+    used_names: set[str],
+    collection_index: dict[str, dict[str, Any]],
+) -> str | None:
     if not report_pdf_path:
         return None
 
-    source_pdf = Path(source_pdf_path)
-    output_name = _unique_output_name(f"{source_pdf.stem}.paper_agent.pdf", used_names)
+    source_pdf_key = str(Path(source_pdf_path).resolve())
+    previous_entry = collection_index.get(source_pdf_key) or {}
+    previous_path_value = previous_entry.get("collected_pdf_path")
+    previous_path = Path(previous_path_value).resolve() if previous_path_value else None
+    previous_name = previous_path.name if previous_path and previous_path.parent == collect_dir else None
+
+    if previous_name in used_names:
+        used_names.remove(previous_name)
+
+    output_name = _unique_output_name(build_collected_pdf_name(report_title, source_pdf_path), used_names)
     destination = collect_dir / output_name
     shutil.copy2(report_pdf_path, destination)
+
+    if previous_path and previous_path.exists() and previous_path != destination and previous_path.parent == collect_dir:
+        previous_path.unlink()
+
+    collection_index[source_pdf_key] = {
+        "paper_title": report_title or "",
+        "collected_pdf_path": str(destination),
+    }
     return str(destination)
 
 
@@ -99,10 +147,17 @@ def _write_batch_json(path: Path, payload: Any) -> None:
 def _run_single_analysis_job(pdf_path: str, output_dir: str, config: RuntimeConfig) -> dict[str, Any]:
     result = run_analysis(pdf_path=pdf_path, output_dir=output_dir, config=config)
     pdf_export = ((result.get("report_exports") or {}).get("pdf") or {}).get("path")
+    report_markdown = str(result.get("report_markdown") or "")
+    report_title = (
+        (result.get("overview") or {}).get("paper_title")
+        or extract_markdown_title(report_markdown)
+        or Path(pdf_path).stem
+    )
     return {
         "pdf_path": pdf_path,
         "run_dir": str(result["run_dir"]),
         "report_pdf_path": pdf_export,
+        "paper_title": report_title,
         "status": "completed",
     }
 
@@ -124,8 +179,17 @@ def _run_single_file(args: argparse.Namespace, config: RuntimeConfig) -> int:
     if args.collect_dir and result.get("report_exports", {}).get("pdf", {}).get("path"):
         collect_dir = Path(args.collect_dir).expanduser().resolve()
         collect_dir.mkdir(parents=True, exist_ok=True)
-        collected_path = collect_dir / f"{Path(args.input_path).stem}.paper_agent.pdf"
-        shutil.copy2(result["report_exports"]["pdf"]["path"], collected_path)
+        used_names = {path.name for path in collect_dir.glob("*.pdf")}
+        collection_index = _load_collection_index(collect_dir)
+        collected_path = _collect_report_pdf(
+            result["report_exports"]["pdf"]["path"],
+            collect_dir,
+            str(Path(args.input_path).resolve()),
+            (result.get("overview") or {}).get("paper_title") or extract_markdown_title(result.get("report_markdown") or ""),
+            used_names,
+            collection_index,
+        )
+        _save_collection_index(collect_dir, collection_index)
         print(f"Collected PDF: {collected_path}")
 
     if args.print_report:
@@ -163,16 +227,18 @@ def _run_directory_batch(args: argparse.Namespace, config: RuntimeConfig) -> int
 
     used_run_dir_names: dict[str, int] = {}
     used_collect_names = {path.name for path in collect_dir.glob("*.pdf")}
+    collection_index = _load_collection_index(collect_dir)
     jobs: list[dict[str, Any]] = []
     for pdf_path in pdf_paths:
         run_dir = _make_job_run_dir(batch_root, pdf_path, used_run_dir_names)
-        collected_name = f"{pdf_path.stem}.paper_agent.pdf"
-        collected_path = collect_dir / collected_name
+        indexed_collected_path = str((collection_index.get(str(pdf_path.resolve())) or {}).get("collected_pdf_path") or "")
+        legacy_collected_path = str((collect_dir / f"{pdf_path.stem}.paper_agent.pdf").resolve())
         jobs.append(
             {
                 "pdf_path": str(pdf_path),
                 "run_dir": str(run_dir),
-                "collected_pdf_path": str(collected_path),
+                "collected_pdf_path": indexed_collected_path or legacy_collected_path,
+                "legacy_collected_pdf_path": legacy_collected_path,
             }
         )
 
@@ -181,9 +247,14 @@ def _run_directory_batch(args: argparse.Namespace, config: RuntimeConfig) -> int
     completed: list[dict[str, Any]] = []
     pending_jobs: list[dict[str, Any]] = []
     for job in jobs:
-        if args.skip_existing and Path(job["collected_pdf_path"]).exists():
+        indexed_path = Path(job["collected_pdf_path"]) if job.get("collected_pdf_path") else None
+        legacy_path = Path(job["legacy_collected_pdf_path"]) if job.get("legacy_collected_pdf_path") else None
+        if args.skip_existing and (
+            (indexed_path is not None and indexed_path.exists()) or (legacy_path is not None and legacy_path.exists())
+        ):
             skipped = dict(job)
             skipped["status"] = "skipped_existing"
+            skipped["collected_pdf_path"] = str(indexed_path if indexed_path and indexed_path.exists() else legacy_path)
             completed.append(skipped)
             log_event("info", "Batch paper skipped", pdf_path=job["pdf_path"], collected_pdf_path=job["collected_pdf_path"])
             continue
@@ -199,8 +270,11 @@ def _run_directory_batch(args: argparse.Namespace, config: RuntimeConfig) -> int
                     result.get("report_pdf_path"),
                     collect_dir,
                     job["pdf_path"],
+                    result.get("paper_title"),
                     used_collect_names,
+                    collection_index,
                 )
+                _save_collection_index(collect_dir, collection_index)
                 completed.append(result)
                 log_event(
                     "info",
@@ -230,8 +304,11 @@ def _run_directory_batch(args: argparse.Namespace, config: RuntimeConfig) -> int
                         result.get("report_pdf_path"),
                         collect_dir,
                         job["pdf_path"],
+                        result.get("paper_title"),
                         used_collect_names,
+                        collection_index,
                     )
+                    _save_collection_index(collect_dir, collection_index)
                     completed.append(result)
                     log_event(
                         "info",

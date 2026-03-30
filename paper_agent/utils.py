@@ -11,6 +11,51 @@ def slugify(text: str, fallback: str = "paper") -> str:
     return slug or fallback
 
 
+def extract_markdown_title(markdown_text: str) -> str | None:
+    for raw_line in markdown_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("# "):
+            title = re.sub(r"\s+", " ", line[2:].strip()).strip()
+            return title or None
+    return None
+
+
+def sanitize_filename(text: str, fallback: str = "paper", max_length: int = 120) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return fallback
+
+    replacements = {
+        "/": " - ",
+        "\\": " - ",
+        ":": " - ",
+        "：": " - ",
+        "|": " - ",
+        "?": "",
+        "*": "",
+        '"': "",
+        "<": "",
+        ">": "",
+    }
+    for source, target in replacements.items():
+        cleaned = cleaned.replace(source, target)
+
+    cleaned = re.sub(r"[\x00-\x1f]", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .-_")
+    if not cleaned:
+        cleaned = fallback
+    if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length].rstrip(" .-_")
+    return cleaned or fallback
+
+
+def build_collected_pdf_name(report_title: str | None, source_pdf_path: str, suffix: str = ".paper_agent.pdf") -> str:
+    source_pdf = Path(source_pdf_path)
+    fallback = sanitize_filename(source_pdf.stem, fallback="paper")
+    base = sanitize_filename(report_title or "", fallback=fallback)
+    return f"{base}{suffix}"
+
+
 def normalize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [re.sub(r"[ \t]+", " ", line).rstrip() for line in text.split("\n")]
