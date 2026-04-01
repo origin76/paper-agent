@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from paper_agent.conference_parsing import (
+from ..parsing import (
     extract_document_paper_metadata,
     looks_like_paper_title,
     normalize_space,
     normalize_title_key,
 )
-from paper_agent.conference_types import ConferencePaper
+from ..types import ConferencePaper
 
 
 class OSDIAdapter:

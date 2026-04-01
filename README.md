@@ -6,6 +6,24 @@ This repository contains a minimal deep paper-reading agent built for one job:
 
 The goal is not a cheap summary. The goal is to spend more tokens on one paper and get closer to an advisor-style guided reading.
 
+## Project Guide
+
+The repository now has three reusable pipelines:
+
+1. `paper-agent-fetch`
+   Discover and download conference PDFs into a structured local workspace.
+2. `paper-agent`
+   Run single-paper or batch paper analysis and export readable Markdown / HTML / PDF reports.
+3. `paper-agent-narrative` + `paper-agent-narrative-detail`
+   Aggregate many existing analysis runs into domain story arcs, then deepen each arc into advisor-style reading booklets.
+
+Recommended reading order for the docs:
+
+- [docs/README.md](docs/README.md): documentation index
+- [docs/pipeline_guide_zh.md](docs/pipeline_guide_zh.md): Chinese workflow handbook for the three pipelines
+- [docs/codebase_map_zh.md](docs/codebase_map_zh.md): codebase map and extension guide
+- [docs/playwright_acm_workflow.md](docs/playwright_acm_workflow.md): reusable ACM / Playwright / Chrome CDP workflow
+
 ## What Changed
 
 This version no longer depends on `fileid://...` or Tavily.
@@ -28,7 +46,7 @@ So the pipeline now works like this:
 
 ## Workflow
 
-The workflow lives in [paper_agent/workflow.py](/Users/zerick/code/longchain/paper_agent/workflow.py).
+The workflow lives in [paper_agent/analysis/workflow.py](/Users/zerick/code/longchain/paper_agent/analysis/workflow.py).
 
 Stages:
 
@@ -297,6 +315,31 @@ paper-agent conference-papers/downloads \
   --recursive \
   --collect-dir /Users/zerick/code/longchain/conference-paper-agent-final-pdfs
 ```
+
+Build story arcs from one or more existing run roots:
+
+```bash
+paper-agent-narrative \
+  runs/20260401-batch-papers \
+  popl-analysis-runs \
+  --output-dir conference-story-arcs
+```
+
+Then deepen each arc and export standalone per-arc Markdown / HTML / PDF booklets:
+
+```bash
+paper-agent-narrative-detail \
+  conference-story-arcs \
+  --output-dir conference-story-arcs/detailed \
+  --skip-existing
+```
+
+The detailed output directory contains:
+
+- `detailed_story_arcs.json`: normalized refined story-arc payloads
+- `detailed_narrative_report.{md,html,pdf}`: one combined domain-development report
+- `arc_reports/*.pdf`: one standalone booklet per story arc
+- `arc_reports/index.json`: machine-readable index of all standalone arc exports
 
 Notes for the conference fetch layer:
 

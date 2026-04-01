@@ -3,14 +3,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from paper_agent.conference_parsing import (
+from ..parsing import (
     extract_document_paper_metadata,
     looks_like_author_line,
     normalize_space,
     normalize_title_key,
     split_authors,
 )
-from paper_agent.conference_types import ConferencePaper
+from ..types import ConferencePaper
 
 
 POPL_FOREIGN_TRACK_MARKERS = (

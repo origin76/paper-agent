@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .browser import playwright_download as _impl
+from .narrative_stack import detail_export as _impl
 
 
 for _name, _value in vars(_impl).items():

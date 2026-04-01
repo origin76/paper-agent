@@ -25,10 +25,10 @@
 代码入口分成三层：
 
 - [paper_agent/chrome_cdp.py](/Users/zerick/code/longchain/paper_agent/chrome_cdp.py)
-  负责克隆 Chrome profile、启动 CDP、检查状态、停止和清理会话
+  兼容入口；真正实现位于 [paper_agent/browser/chrome_cdp.py](/Users/zerick/code/longchain/paper_agent/browser/chrome_cdp.py)
 - [paper_agent/playwright_download.py](/Users/zerick/code/longchain/paper_agent/playwright_download.py)
-  负责 Playwright 下载 PDF、处理 Cookiebot/Cloudflare、记录浏览器链路日志
-- [paper_agent/conference_fetch.py](/Users/zerick/code/longchain/paper_agent/conference_fetch.py)
+  兼容入口；真正实现位于 [paper_agent/browser/playwright_download.py](/Users/zerick/code/longchain/paper_agent/browser/playwright_download.py)
+- [paper_agent/conference/fetch.py](/Users/zerick/code/longchain/paper_agent/conference/fetch.py)
   负责 venue 发现、HTTP 下载、ACM browser-first 策略、失败回退和最终落盘
 
 现在的 ACM 策略是：
@@ -317,4 +317,4 @@ python -m paper_agent.chrome_cdp stop \
 - `status`/`stop` 已经可以直接脚本化
 - `stop --cleanup-artifacts` 可以把一轮会话的临时痕迹完整收掉
 
-如果以后要扩到更多被浏览器态保护的站点，这条链路可以直接复用，只需要在 `conference_fetch.py` 里扩展“哪些 host 走 browser-first”即可。
+如果以后要扩到更多被浏览器态保护的站点，这条链路可以直接复用，只需要在 `conference/fetch.py` 里扩展“哪些 host 走 browser-first”即可。

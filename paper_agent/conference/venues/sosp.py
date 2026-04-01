@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from paper_agent.conference_parsing import extract_title_author_blocks, looks_like_paper_title, normalize_space
-from paper_agent.conference_types import ConferencePaper
+from ..parsing import extract_title_author_blocks, looks_like_paper_title, normalize_space
+from ..types import ConferencePaper
 
 
 SOSP_ACCEPTED_URLS = {

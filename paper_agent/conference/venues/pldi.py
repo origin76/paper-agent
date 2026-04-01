@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from paper_agent.conference_parsing import (
+from ..parsing import (
     extract_document_paper_metadata,
     looks_like_author_line,
     looks_like_paper_title,
@@ -11,7 +11,7 @@ from paper_agent.conference_parsing import (
     normalize_title_key,
     split_authors,
 )
-from paper_agent.conference_types import ConferencePaper
+from ..types import ConferencePaper
 
 
 PLDI_BRACKETED_FOREIGN_TRACK_MARKERS = (
