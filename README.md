@@ -164,7 +164,7 @@ Fetch recent conference papers into a reusable local workspace before analysis:
 
 ```bash
 paper-agent-fetch \
-  --venues osdi,sosp,pldi \
+  --venues osdi,sosp,pldi,popl \
   --years 2023-2025 \
   --output-root conference-papers \
   --skip-existing
@@ -186,7 +186,7 @@ You can also point the fetcher at a cookie file instead of an env var:
 
 ```bash
 paper-agent-fetch \
-  --venues pldi,sosp \
+  --venues pldi,popl,sosp \
   --years 2023-2025 \
   --output-root conference-papers \
   --acm-cookie-file ~/Downloads/acm-cookies.txt \
@@ -202,47 +202,79 @@ The ACM cookie file can be either:
 If cookies are still not enough because ACM / Cloudflare only trusts a real browser session, the fetcher can fall back to Playwright for ACM PDF URLs. The most reliable mode is to attach to your already-authenticated Chrome via CDP:
 
 ```bash
-python3 -m pip install playwright
-
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$HOME/Library/Application Support/Google/Chrome" \
-  --profile-directory="Default"
+eval "$(paper-agent-chrome-cdp prepare --profile-directory Default --output shell)"
 ```
 
-Then run the fetcher with browser fallback enabled:
+If your environment has not been reinstalled since the new script entry was added, use `python -m paper_agent.chrome_cdp ...` instead of `paper-agent-chrome-cdp ...`.
+
+Then verify the browser session and run the fetcher against that CDP endpoint:
+
+```bash
+paper-agent-chrome-cdp status \
+  --session-file "$PAPER_AGENT_CHROME_CDP_SESSION_FILE"
+
+paper-agent-fetch \
+  --venues pldi,popl,sosp \
+  --years 2023-2025 \
+  --output-root conference-papers \
+  --playwright-cdp-url "$PAPER_AGENT_PLAYWRIGHT_CDP_URL" \
+  --skip-existing
+```
+
+When the batch is done, stop the cloned-profile browser session:
+
+```bash
+paper-agent-chrome-cdp stop \
+  --session-file "$PAPER_AGENT_CHROME_CDP_SESSION_FILE"
+```
+
+If you also want to remove the temporary cloned Chrome profile plus the generated `session.json` and `chrome.log`:
+
+```bash
+paper-agent-chrome-cdp stop \
+  --session-file "$PAPER_AGENT_CHROME_CDP_SESSION_FILE" \
+  --cleanup-artifacts
+```
+
+The `paper-agent-chrome-cdp` helper does four things for you:
+
+- clones the selected Chrome profile into a temporary directory so the live profile lock is never touched
+- launches a real Chrome process with `--remote-debugging-port`
+- waits until `http://127.0.0.1:<port>/json/version` is actually ready
+- prints reusable shell exports such as `PAPER_AGENT_PLAYWRIGHT_CDP_URL` and `PAPER_AGENT_CHROME_CDP_SESSION_FILE`
+
+If you still want the lower-level manual modes, both are supported:
 
 ```bash
 paper-agent-fetch \
-  --venues pldi,sosp \
+  --venues pldi,popl,sosp \
   --years 2023-2025 \
   --output-root conference-papers \
-  --acm-browser-fallback \
   --playwright-cdp-url http://127.0.0.1:9222 \
   --skip-existing
 ```
 
-You can also let Playwright launch Chrome itself instead of attaching to an existing CDP session:
-
 ```bash
 paper-agent-fetch \
-  --venues pldi,sosp \
+  --venues pldi,popl,sosp \
   --years 2023-2025 \
   --output-root conference-papers \
-  --acm-browser-fallback \
   --playwright-user-data-dir "$HOME/Library/Application Support/Google/Chrome" \
   --playwright-profile-directory Default \
   --skip-existing
 ```
 
-Notes for Playwright fallback:
+Notes for the reusable Playwright ACM workflow:
 
-- The browser fallback is only used for ACM PDF URLs after the normal HTTP download path fails.
-- `run.log` will show `Conference PDF switching to Playwright fallback` and `Playwright PDF download ...` events for each fallback attempt.
+- The recommended path is `paper-agent-chrome-cdp prepare --output shell` plus `paper-agent-fetch --playwright-cdp-url ...`.
+- ACM PDF URLs now prefer Playwright as the primary transport when a browser session is configured, instead of waiting for HTTP 403 / challenge failures first.
+- `run.log` will show `Conference PDF using Playwright as primary transport` and `Playwright PDF download ...` events for browser-driven ACM downloads.
 - The manifest metadata records `download_transport=http` or `download_transport=playwright:...`.
-- Reusing the live Chrome session via `--playwright-cdp-url` is usually more reliable than launching a fresh browser against the same profile.
-- If your normal Chrome is already running, `--playwright-user-data-dir ~/Library/Application Support/Google/Chrome` will usually fail with a profile lock. In that case prefer CDP attach mode.
-- When ACM returns a Cloudflare interstitial, the fallback will wait briefly for the browser challenge to clear before it fetches the PDF.
+- Reusing a cloned-profile CDP Chrome session is usually more reliable than pointing Playwright directly at the live profile.
+- If your normal Chrome is already running, `--playwright-user-data-dir ~/Library/Application Support/Google/Chrome` can fail with a profile lock. The cloned-profile CDP helper avoids that.
+- The helper is especially useful when ACM shows Cloudflare `请稍候...` or similar interstitials that only clear in a real user Chrome session.
+- `paper-agent-chrome-cdp status` now returns structured JSON on both success and failure, which makes it easier to script health checks.
+- A fuller operational guide, including Chrome profile prep and shell profile snippets, lives in [docs/playwright_acm_workflow.md](docs/playwright_acm_workflow.md).
 
 The fetch workspace is organized like this:
 
@@ -271,10 +303,12 @@ Notes for the conference fetch layer:
 - `manifests/*.json` records every discovered paper plus the resolved metadata / download path.
 - `unresolved/*.json` collects papers whose PDF could not be resolved or downloaded.
 - `indexes/download_index.json` provides one flat list of all downloaded PDFs.
-- OSDI and PLDI rely primarily on official conference pages.
+- OSDI, PLDI, and POPL rely primarily on official conference pages.
 - SOSP starts from the official accepted-paper page and then uses DBLP / arXiv as weak supplemental resolution when no direct PDF is available.
 - the fetcher now sends browser-style HTTP headers by default and can attach ACM-specific cookies via `PAPER_AGENT_ACM_COOKIE_HEADER`, `--acm-cookie-file`, or the generic HTTP cookie options
-- ACM downloads can optionally escalate to a real Chrome session via Playwright using `--acm-browser-fallback` plus either `--playwright-cdp-url` or `--playwright-user-data-dir`
+- ACM downloads can escalate to a real Chrome session via Playwright using either `--playwright-cdp-url` or `--playwright-user-data-dir`
+- If `--playwright-cdp-url` or `--playwright-user-data-dir` is configured, ACM Playwright handling auto-enables unless you explicitly pass `--no-acm-browser-fallback`
+- The recommended reusable setup is `paper-agent-chrome-cdp prepare --output shell`, which launches a cloned-profile Chrome CDP session without touching the live profile lock
 - Every HTTP request and venue-year phase is logged under `conference-papers/logs/.../run.log` and `stage_trace.jsonl`.
 
 ## Output Artifacts

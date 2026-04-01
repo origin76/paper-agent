@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -29,19 +30,24 @@ from paper_agent.playwright_download import (
     DEFAULT_ACM_BROWSER_FALLBACK_ENV,
     DEFAULT_PLAYWRIGHT_BROWSER_EXECUTABLE_ENV,
     DEFAULT_PLAYWRIGHT_CDP_URL_ENV,
+    DEFAULT_PLAYWRIGHT_DOWNLOAD_POOL_SIZE_ENV,
     DEFAULT_PLAYWRIGHT_HEADLESS_ENV,
     DEFAULT_PLAYWRIGHT_LAUNCH_TIMEOUT_MS_ENV,
     DEFAULT_PLAYWRIGHT_NAVIGATION_TIMEOUT_MS_ENV,
     DEFAULT_PLAYWRIGHT_PROFILE_DIRECTORY_ENV,
+    DEFAULT_PLAYWRIGHT_TOTAL_TIMEOUT_MS_ENV,
     DEFAULT_PLAYWRIGHT_USER_DATA_DIR_ENV,
     BrowserPDFDownloader,
+    BrowserPDFDownloaderPool,
     PlaywrightPDFDownloader,
     build_playwright_download_config,
+    infer_playwright_browser_fallback_enabled,
     resolve_playwright_env_config,
 )
 from paper_agent.runtime import append_stage_trace, configure_logging, log_event
 from paper_agent.utils import sanitize_filename, write_json
 from paper_agent.venue_osdi import OSDIAdapter
+from paper_agent.venue_popl import POPLAdapter
 from paper_agent.venue_pldi import PLDIAdapter
 from paper_agent.venue_sosp import SOSPAdapter
 
@@ -58,6 +64,26 @@ DEFAULT_COOKIE_FILE_ENV = "PAPER_AGENT_COOKIE_FILE"
 DEFAULT_ACM_COOKIE_HEADER_ENV = "PAPER_AGENT_ACM_COOKIE_HEADER"
 DEFAULT_ACM_COOKIE_FILE_ENV = "PAPER_AGENT_ACM_COOKIE_FILE"
 ACM_PDF_HOST = "dl.acm.org"
+ACM_HOST_SUFFIX = ".acm.org"
+HOST_REQUEST_MIN_INTERVALS: tuple[tuple[str, float], ...] = (
+    ("api.openalex.org", 0.75),
+    ("export.arxiv.org", 1.50),
+    ("arxiv.org", 1.00),
+    ("dblp.org", 0.35),
+)
+SUPPLEMENTAL_RATE_LIMIT_SHORT_CIRCUIT_HOSTS: tuple[str, ...] = (
+    "api.openalex.org",
+    "export.arxiv.org",
+    "arxiv.org",
+)
+MAX_RETRY_AFTER_SECONDS = 30.0
+OPENALEX_COOLDOWN_SECONDS = 600.0
+ARXIV_COOLDOWN_SECONDS = 300.0
+
+
+def is_acm_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host == "acm.org" or host.endswith(ACM_HOST_SUFFIX)
 
 
 def derive_pdf_download_referer(url: str) -> str | None:
@@ -179,10 +205,11 @@ class ConferenceHTTPClient:
         self.default_cookie_source = default_cookie_source
         self.acm_cookie_source = acm_cookie_source
         self.browser_pdf_downloader = browser_pdf_downloader
+        self._host_rate_limit_lock = threading.Lock()
+        self._host_next_allowed_at: dict[str, float] = {}
 
     def _cookie_header_for_url(self, url: str) -> str | None:
-        host = urlparse(url).netloc.lower()
-        if host == ACM_PDF_HOST and self.acm_cookie_source is not None:
+        if is_acm_url(url) and self.acm_cookie_source is not None:
             return self.acm_cookie_source.header_for_url(url)
         if self.default_cookie_source is not None:
             return self.default_cookie_source.header_for_url(url)
@@ -208,11 +235,77 @@ class ConferenceHTTPClient:
 
         return Request(url, headers=headers)
 
+    @staticmethod
+    def _normalized_host(url: str) -> str:
+        return urlparse(url).netloc.lower().split(":", 1)[0]
+
+    def _host_min_interval_seconds(self, url: str) -> float:
+        host = self._normalized_host(url)
+        for pattern, seconds in HOST_REQUEST_MIN_INTERVALS:
+            if host == pattern or host.endswith(f".{pattern}"):
+                return seconds
+        return 0.0
+
+    def _throttle_for_host(self, url: str, *, stage: str) -> None:
+        host = self._normalized_host(url)
+        min_interval_seconds = self._host_min_interval_seconds(url)
+        if not host or min_interval_seconds <= 0:
+            return
+
+        with self._host_rate_limit_lock:
+            now = time.monotonic()
+            next_allowed_at = self._host_next_allowed_at.get(host, 0.0)
+            wait_seconds = max(0.0, next_allowed_at - now)
+            reserved_start = max(now, next_allowed_at)
+            self._host_next_allowed_at[host] = reserved_start + min_interval_seconds
+
+        if wait_seconds <= 0:
+            return
+
+        log_event(
+            "info",
+            "Conference HTTP host throttle waiting",
+            url=url,
+            host=host,
+            stage=stage,
+            wait_seconds=f"{wait_seconds:.2f}",
+            min_interval_seconds=f"{min_interval_seconds:.2f}",
+        )
+        time.sleep(wait_seconds)
+
+    @staticmethod
+    def _retry_after_seconds(exc: Exception) -> float | None:
+        if not isinstance(exc, HTTPError) or exc.headers is None:
+            return None
+        retry_after = str(exc.headers.get("Retry-After") or "").strip()
+        if not retry_after:
+            return None
+        try:
+            return min(MAX_RETRY_AFTER_SECONDS, max(0.0, float(retry_after)))
+        except ValueError:
+            return None
+
+    def _retry_sleep_seconds(self, url: str, attempt: int, exc: Exception) -> float:
+        base_sleep = max(0.0, self.retry_backoff_seconds * attempt)
+        host_interval_seconds = self._host_min_interval_seconds(url)
+        penalty_sleep = 0.0
+        if isinstance(exc, HTTPError) and exc.code == 429:
+            penalty_sleep = max(host_interval_seconds * (attempt + 1), self.retry_backoff_seconds * max(2, attempt))
+        retry_after_seconds = self._retry_after_seconds(exc) or 0.0
+        return max(base_sleep, penalty_sleep, retry_after_seconds)
+
+    def _should_short_circuit_rate_limit(self, url: str, exc: Exception) -> bool:
+        if not isinstance(exc, HTTPError) or exc.code != 429:
+            return False
+        host = self._normalized_host(url)
+        return any(host == pattern or host.endswith(f".{pattern}") for pattern in SUPPLEMENTAL_RATE_LIMIT_SHORT_CIRCUIT_HOSTS)
+
     def fetch_text(self, url: str) -> tuple[str, str, str]:
         start_time = time.perf_counter()
         log_event("info", "Conference HTTP text request started", url=url)
         for attempt in range(1, self.retry_attempts + 1):
             try:
+                self._throttle_for_host(url, stage="text")
                 with urlopen(self._build_request(url, "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"), timeout=self.timeout_seconds) as response:
                     final_url = response.geturl() or url
                     content_type = response.headers.get("Content-Type", "")
@@ -229,9 +322,28 @@ class ConferenceHTTPClient:
                     duration_seconds=f"{time.perf_counter() - start_time:.2f}",
                     error=str(exc),
                 )
+                if self._should_short_circuit_rate_limit(url, exc):
+                    log_event(
+                        "warning",
+                        "Conference HTTP retry short-circuited after rate limit",
+                        url=url,
+                        attempt=attempt,
+                        stage="text",
+                    )
+                    raise
                 if not should_retry:
                     raise
-                time.sleep(self.retry_backoff_seconds * attempt)
+                sleep_seconds = self._retry_sleep_seconds(url, attempt, exc)
+                if sleep_seconds > 0:
+                    log_event(
+                        "info",
+                        "Conference HTTP retry backoff scheduled",
+                        url=url,
+                        attempt=attempt,
+                        stage="text",
+                        sleep_seconds=f"{sleep_seconds:.2f}",
+                    )
+                    time.sleep(sleep_seconds)
 
         if content_type.lower().startswith("application/pdf") or raw_bytes.startswith(b"%PDF"):
             raise ReturnedPDFError(url=url, final_url=final_url)
@@ -261,6 +373,33 @@ class ConferenceHTTPClient:
         return ElementTree.fromstring(text), final_url
 
     def download_pdf(self, url: str, destination: Path) -> dict[str, Any]:
+        if self._must_force_browser_download(url):
+            if self.browser_pdf_downloader is None:
+                raise RuntimeError(
+                    "ACM PDF URLs require Playwright transport because direct HTTP access is expected to fail. "
+                    "Configure PAPER_AGENT_PLAYWRIGHT_CDP_URL or PAPER_AGENT_PLAYWRIGHT_USER_DATA_DIR."
+                )
+            try:
+                log_event(
+                    "info",
+                    "Conference PDF forcing Playwright transport for ACM URL",
+                    url=url,
+                    destination=destination,
+                )
+                return self.browser_pdf_downloader.download_pdf(  # type: ignore[union-attr]
+                    url,
+                    destination,
+                    referer=derive_pdf_download_referer(url),
+                )
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "Conference PDF Playwright transport failed for ACM URL",
+                    url=url,
+                    destination=destination,
+                    error=str(exc),
+                )
+                raise
         try:
             return self._download_pdf_via_http(url, destination)
         except Exception as exc:
@@ -278,6 +417,10 @@ class ConferenceHTTPClient:
                 destination,
                 referer=derive_pdf_download_referer(url),
             )
+
+    @staticmethod
+    def _must_force_browser_download(url: str) -> bool:
+        return is_acm_url(url)
 
     def _download_pdf_via_http(self, url: str, destination: Path) -> dict[str, Any]:
         start_time = time.perf_counter()
@@ -298,6 +441,7 @@ class ConferenceHTTPClient:
                 prefix = b""
                 if tmp_path.exists():
                     tmp_path.unlink()
+                self._throttle_for_host(url, stage="pdf")
                 with urlopen(
                     self._build_request(
                         url,
@@ -336,7 +480,17 @@ class ConferenceHTTPClient:
                 )
                 if not should_retry:
                     raise
-                time.sleep(self.retry_backoff_seconds * attempt)
+                sleep_seconds = self._retry_sleep_seconds(url, attempt, exc)
+                if sleep_seconds > 0:
+                    log_event(
+                        "info",
+                        "Conference HTTP retry backoff scheduled",
+                        url=url,
+                        attempt=attempt,
+                        stage="pdf",
+                        sleep_seconds=f"{sleep_seconds:.2f}",
+                    )
+                    time.sleep(sleep_seconds)
 
         if not prefix.startswith(b"%PDF"):
             if tmp_path.exists():
@@ -366,10 +520,24 @@ class ConferenceHTTPClient:
     def _should_attempt_browser_fallback(self, url: str, exc: Exception) -> bool:
         if self.browser_pdf_downloader is None:
             return False
-        if urlparse(url).netloc.lower() != ACM_PDF_HOST:
+        if not is_acm_url(url):
             return False
         if isinstance(exc, HTTPError):
             return exc.code in {401, 403, 429}
+        if isinstance(exc, URLError):
+            message = str(exc.reason).lower()
+            if any(
+                marker in message
+                for marker in (
+                    "nodename nor servname provided",
+                    "name or service not known",
+                    "temporary failure in name resolution",
+                    "getaddrinfo failed",
+                    "connection refused",
+                    "network is unreachable",
+                )
+            ):
+                return True
         message = str(exc).lower()
         return any(
             marker in message
@@ -379,6 +547,9 @@ class ConferenceHTTPClient:
                 "cloudflare",
                 "challenge",
                 "blocked",
+                "nodename nor servname provided",
+                "name or service not known",
+                "temporary failure in name resolution",
             )
         )
 
@@ -456,15 +627,35 @@ class ConferenceFetchService:
         )
         self.adapters = {
             "osdi": OSDIAdapter(),
+            "popl": POPLAdapter(),
             "pldi": PLDIAdapter(),
             "sosp": SOSPAdapter(),
         }
+        self._supplement_source_lock = threading.Lock()
+        self._supplement_disabled_until: dict[str, float] = {"openalex": 0.0, "arxiv": 0.0}
         self.manifests_dir = self.output_root / "manifests"
         self.downloads_dir = self.output_root / "downloads"
         self.unresolved_dir = self.output_root / "unresolved"
         self.indexes_dir = self.output_root / "indexes"
         for path in (self.manifests_dir, self.downloads_dir, self.unresolved_dir, self.indexes_dir):
             path.mkdir(parents=True, exist_ok=True)
+
+    def _is_supplement_source_disabled(self, source: str) -> bool:
+        with self._supplement_source_lock:
+            disabled_until = self._supplement_disabled_until.get(source, 0.0)
+        return time.monotonic() < disabled_until
+
+    def _disable_supplement_source(self, source: str, *, cooldown_seconds: float, error: Exception) -> None:
+        disabled_until = time.monotonic() + max(0.0, cooldown_seconds)
+        with self._supplement_source_lock:
+            self._supplement_disabled_until[source] = max(self._supplement_disabled_until.get(source, 0.0), disabled_until)
+        log_event(
+            "warning",
+            "Conference supplemental source temporarily disabled",
+            source=source,
+            cooldown_seconds=f"{cooldown_seconds:.0f}",
+            error=str(error),
+        )
 
     def run(self, venues: list[str], years: list[int]) -> dict[str, Any]:
         summary_items: list[dict[str, Any]] = []
@@ -553,36 +744,57 @@ class ConferenceFetchService:
             append_stage_trace(self.run_dir, f"discover.{stage_prefix}", "finished", paper_count=len(papers), index_url=index_url)
             log_event("info", "Conference discovery finished", venue=venue, year=year, paper_count=len(papers), index_url=index_url)
 
-            papers = self._parallel_map(
-                papers,
-                self.resolve_workers,
-                lambda paper: self._enrich_paper(adapter, paper),
-            )
+            existing_papers, papers = self._prefilter_existing_papers(papers)
+            if existing_papers:
+                append_stage_trace(
+                    self.run_dir,
+                    f"prefilter.{stage_prefix}",
+                    "finished",
+                    reused_count=len(existing_papers),
+                    pending_count=len(papers),
+                )
+                log_event(
+                    "info",
+                    "Conference prefilter reused existing PDFs",
+                    venue=venue,
+                    year=year,
+                    reused_count=len(existing_papers),
+                    pending_count=len(papers),
+                )
 
-            if self.enable_supplemental_lookups:
-                append_stage_trace(self.run_dir, f"supplement.{stage_prefix}", "started", paper_count=len(papers))
+            if papers:
                 papers = self._parallel_map(
                     papers,
                     self.resolve_workers,
-                    self._supplement_paper,
+                    lambda paper: self._enrich_paper(adapter, paper),
                 )
-                append_stage_trace(self.run_dir, f"supplement.{stage_prefix}", "finished", paper_count=len(papers))
 
-            if not self.dry_run:
-                append_stage_trace(self.run_dir, f"download.{stage_prefix}", "started", paper_count=len(papers))
-                papers = self._parallel_map(
-                    papers,
-                    self.download_workers,
-                    self._download_paper,
-                )
-                append_stage_trace(
-                    self.run_dir,
-                    f"download.{stage_prefix}",
-                    "finished",
-                    paper_count=len(papers),
-                    downloaded_count=sum(1 for item in papers if item.status in {"downloaded", "existing"}),
-                    unresolved_count=sum(1 for item in papers if item.status not in {"downloaded", "existing"}),
-                )
+                if self.enable_supplemental_lookups:
+                    append_stage_trace(self.run_dir, f"supplement.{stage_prefix}", "started", paper_count=len(papers))
+                    papers = self._parallel_map(
+                        papers,
+                        self.resolve_workers,
+                        self._supplement_paper,
+                    )
+                    append_stage_trace(self.run_dir, f"supplement.{stage_prefix}", "finished", paper_count=len(papers))
+
+                if not self.dry_run:
+                    append_stage_trace(self.run_dir, f"download.{stage_prefix}", "started", paper_count=len(papers))
+                    papers = self._parallel_map(
+                        papers,
+                        self.download_workers,
+                        self._download_paper,
+                    )
+                    append_stage_trace(
+                        self.run_dir,
+                        f"download.{stage_prefix}",
+                        "finished",
+                        paper_count=len(papers),
+                        downloaded_count=sum(1 for item in papers if item.status in {"downloaded", "existing"}),
+                        unresolved_count=sum(1 for item in papers if item.status not in {"downloaded", "existing"}),
+                    )
+
+            papers = existing_papers + papers
 
             manifest = ConferenceManifest(
                 venue=venue,
@@ -675,6 +887,24 @@ class ConferenceFetchService:
                 results[index] = future.result()
         return [paper for paper in results if paper is not None]
 
+    def _prefilter_existing_papers(self, papers: list[ConferencePaper]) -> tuple[list[ConferencePaper], list[ConferencePaper]]:
+        if not self.skip_existing:
+            return [], papers
+
+        existing_papers: list[ConferencePaper] = []
+        pending_papers: list[ConferencePaper] = []
+        for paper in papers:
+            destination = self._destination_for_paper(paper)
+            if destination.exists() and destination.stat().st_size > 0:
+                paper.status = "existing"
+                paper.download_path = str(destination)
+                paper.download_url = paper.download_url or paper.pdf_url or paper.preprint_url or paper.doi_url
+                paper.add_trace("prefilter:reused_existing_file_before_enrich")
+                existing_papers.append(paper)
+            else:
+                pending_papers.append(paper)
+        return existing_papers, pending_papers
+
     def _enrich_paper(self, adapter: Any, paper: ConferencePaper) -> ConferencePaper:
         log_event("info", "Conference paper enrich started", venue=paper.venue, year=paper.year, title=paper.title)
         try:
@@ -707,9 +937,12 @@ class ConferenceFetchService:
             return paper
 
         paper = self._supplement_from_dblp(paper)
+        if paper.doi_url and not paper.pdf_url and not paper.preprint_url:
+            paper.add_trace("supplement:external_lookup_skipped_doi_already_present")
+            return paper
         if not paper.pdf_url and not paper.preprint_url:
             paper = self._supplement_from_openalex(paper)
-        if not paper.pdf_url and not paper.preprint_url and not paper.alternate_urls:
+        if not paper.pdf_url and not paper.preprint_url and not paper.alternate_urls and not paper.doi_url:
             paper = self._supplement_from_arxiv(paper)
         return paper
 
@@ -825,6 +1058,9 @@ class ConferenceFetchService:
             return paper
 
     def _supplement_from_openalex(self, paper: ConferencePaper) -> ConferencePaper:
+        if self._is_supplement_source_disabled("openalex"):
+            paper.add_trace("supplement:openalex_skipped_rate_limited")
+            return paper
         try:
             if paper.doi_url:
                 query_url = f"https://api.openalex.org/works?filter=doi:{paper.doi_url}&per-page=5"
@@ -913,10 +1149,15 @@ class ConferenceFetchService:
             paper.add_trace("supplement:openalex_match_applied")
             return paper
         except Exception as exc:
+            if isinstance(exc, HTTPError) and exc.code == 429:
+                self._disable_supplement_source("openalex", cooldown_seconds=OPENALEX_COOLDOWN_SECONDS, error=exc)
             paper.add_trace(f"supplement:openalex_error={exc}")
             return paper
 
     def _supplement_from_arxiv(self, paper: ConferencePaper) -> ConferencePaper:
+        if self._is_supplement_source_disabled("arxiv"):
+            paper.add_trace("supplement:arxiv_skipped_rate_limited")
+            return paper
         try:
             params = urlencode({"search_query": f'ti:"{paper.title}"', "start": 0, "max_results": 5})
             root, final_url = self.http.fetch_xml_root(f"https://export.arxiv.org/api/query?{params}")
@@ -948,10 +1189,12 @@ class ConferenceFetchService:
             paper.add_trace("supplement:arxiv_match_applied")
             return paper
         except Exception as exc:
+            if isinstance(exc, HTTPError) and exc.code == 429:
+                self._disable_supplement_source("arxiv", cooldown_seconds=ARXIV_COOLDOWN_SECONDS, error=exc)
             paper.add_trace(f"supplement:arxiv_error={exc}")
             return paper
 
-    def _resolve_pdf_url(self, paper: ConferencePaper) -> str | None:
+    def _resolve_pdf_urls(self, paper: ConferencePaper) -> list[str]:
         candidates: list[str] = []
         for label, candidate in (
             ("pdf_url", paper.pdf_url),
@@ -969,19 +1212,26 @@ class ConferenceFetchService:
             if normalized not in candidates:
                 candidates.append(normalized)
 
+        resolved_candidates: list[str] = []
         for candidate in candidates:
             resolved = self._resolve_pdf_candidate(candidate)
             if resolved:
                 paper.add_trace(f"resolve:pdf_candidate={candidate} -> {resolved}")
-                return resolved
+                if resolved not in resolved_candidates:
+                    resolved_candidates.append(resolved)
 
         direct_doi_pdf = infer_doi_pdf_candidate(paper.doi_url or "")
-        if direct_doi_pdf:
+        if direct_doi_pdf and direct_doi_pdf not in resolved_candidates:
             paper.add_trace(f"resolve:doi_pdf_guess={direct_doi_pdf}")
-            return direct_doi_pdf
+            resolved_candidates.append(direct_doi_pdf)
 
-        paper.add_trace("resolve:no_pdf_url_found")
-        return None
+        if not resolved_candidates:
+            paper.add_trace("resolve:no_pdf_url_found")
+        return resolved_candidates
+
+    def _resolve_pdf_url(self, paper: ConferencePaper) -> str | None:
+        resolved_candidates = self._resolve_pdf_urls(paper)
+        return resolved_candidates[0] if resolved_candidates else None
 
     @staticmethod
     def _looks_like_listing_page_url(url: str) -> bool:
@@ -1049,30 +1299,43 @@ class ConferenceFetchService:
             paper.add_trace("download:reused_existing_file")
             return paper
 
-        resolved_url = self._resolve_pdf_url(paper)
-        if not resolved_url:
+        resolved_urls = self._resolve_pdf_urls(paper)
+        if not resolved_urls:
             paper.status = "unresolved"
             paper.download_error = "No PDF URL could be resolved"
             paper.add_note("未能解析到可下载 PDF，已写入 unresolved 清单。")
             return paper
 
-        try:
-            download_meta = self.http.download_pdf(resolved_url, destination)
-            paper.download_url = str(download_meta["final_url"] or resolved_url)
-            paper.download_path = str(destination)
-            paper.status = "downloaded"
-            paper.metadata["download_content_type"] = download_meta["content_type"]
-            paper.metadata["download_bytes"] = download_meta["byte_count"]
-            if download_meta.get("transport"):
-                paper.metadata["download_transport"] = download_meta["transport"]
-            paper.add_source_url(resolved_url)
-            paper.add_source_url(paper.download_url)
-            paper.add_trace(f"download:success={paper.download_url}")
-        except Exception as exc:
-            paper.status = "unresolved"
-            paper.download_error = str(exc)
-            paper.add_note("PDF 下载失败，详情见 resolution_trace 与 run.log。")
-            paper.add_trace(f"download:error={exc}")
+        attempt_failures: list[dict[str, str]] = []
+        for resolved_url in resolved_urls:
+            try:
+                download_meta = self.http.download_pdf(resolved_url, destination)
+                paper.download_url = str(download_meta["final_url"] or resolved_url)
+                paper.download_path = str(destination)
+                paper.status = "downloaded"
+                paper.metadata["download_content_type"] = download_meta["content_type"]
+                paper.metadata["download_bytes"] = download_meta["byte_count"]
+                if download_meta.get("transport"):
+                    paper.metadata["download_transport"] = download_meta["transport"]
+                if attempt_failures:
+                    paper.metadata["download_failures"] = attempt_failures
+                paper.add_source_url(resolved_url)
+                paper.add_source_url(paper.download_url)
+                paper.add_trace(f"download:success={paper.download_url}")
+                return paper
+            except Exception as exc:
+                failure = {"url": resolved_url, "error": str(exc)}
+                attempt_failures.append(failure)
+                paper.add_trace(f"download:attempt_error={resolved_url} error={exc}")
+
+        paper.status = "unresolved"
+        if attempt_failures:
+            paper.metadata["download_failures"] = attempt_failures
+            paper.download_error = attempt_failures[-1]["error"]
+        else:
+            paper.download_error = "Unknown PDF download failure"
+        paper.add_note("PDF 下载失败，详情见 resolution_trace 与 run.log。")
+        paper.add_trace(f"download:error={paper.download_error}")
         return paper
 
 
@@ -1117,9 +1380,9 @@ def _resolve_env_value(explicit_env_name: str | None, fallback_env_name: str) ->
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Discover and download conference paper PDFs for OSDI / SOSP / PLDI into a local batch workspace.",
+        description="Discover and download conference paper PDFs for OSDI / SOSP / PLDI / POPL into a local batch workspace.",
     )
-    parser.add_argument("--venues", default="osdi,sosp,pldi", help="Comma-separated venues. Supported: osdi,sosp,pldi")
+    parser.add_argument("--venues", default="osdi,sosp,pldi,popl", help="Comma-separated venues. Supported: osdi,sosp,pldi,popl")
     parser.add_argument("--years", help="Comma-separated years or ranges, for example 2023,2024,2025 or 2023-2025")
     parser.add_argument("--output-root", default="conference-papers", help="Workspace root for manifests, downloads, unresolved, and logs")
     parser.add_argument("--resolve-workers", type=int, default=6, help="Concurrent workers for detail-page enrichment and metadata supplement")
@@ -1177,6 +1440,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help=f"Playwright navigation timeout in milliseconds, default env: {DEFAULT_PLAYWRIGHT_NAVIGATION_TIMEOUT_MS_ENV}",
     )
+    parser.add_argument(
+        "--playwright-download-pool-size",
+        type=int,
+        help=(
+            "Number of concurrent Playwright downloader slots for ACM PDFs. "
+            f"Default env: {DEFAULT_PLAYWRIGHT_DOWNLOAD_POOL_SIZE_ENV}; "
+            "if omitted, defaults to min(download_workers, 4)."
+        ),
+    )
+    parser.add_argument(
+        "--playwright-total-timeout-ms",
+        type=int,
+        help=(
+            "Hard upper bound for a single Playwright PDF download across all stages. "
+            f"Default env: {DEFAULT_PLAYWRIGHT_TOTAL_TIMEOUT_MS_ENV}; "
+            "if omitted, defaults to max(180000, 3 * navigation_timeout_ms)."
+        ),
+    )
     parser.add_argument("--limit-per-venue", type=int, help="Only keep the first N discovered papers per venue-year")
     parser.add_argument("--skip-existing", action="store_true", help="Reuse an existing downloaded PDF if the destination path already exists")
     parser.add_argument("--dry-run", action="store_true", help="Only generate manifests and unresolved lists, without downloading PDFs")
@@ -1195,7 +1476,7 @@ def main() -> int:
 
     venues = _parse_csv_items(args.venues)
     years = _parse_years(args.years)
-    supported_venues = {"osdi", "sosp", "pldi"}
+    supported_venues = {"osdi", "sosp", "pldi", "popl"}
     unknown_venues = [venue for venue in venues if venue not in supported_venues]
     if unknown_venues:
         parser.exit(status=1, message=f"Unsupported venues: {', '.join(unknown_venues)}\n")
@@ -1222,28 +1503,74 @@ def main() -> int:
         source_label=acm_cookie_env_name or (str(acm_cookie_file) if acm_cookie_file else None),
     )
     playwright_env = resolve_playwright_env_config()
-    playwright_enabled = playwright_env["enabled"] if args.acm_browser_fallback is None else bool(args.acm_browser_fallback)
+    resolved_playwright_cdp_url = args.playwright_cdp_url or playwright_env["cdp_url"]
+    resolved_playwright_user_data_dir = args.playwright_user_data_dir or playwright_env["user_data_dir"]
+    resolved_playwright_launch_timeout_ms = (
+        args.playwright_launch_timeout_ms if args.playwright_launch_timeout_ms is not None else playwright_env["launch_timeout_ms"]
+    )
+    resolved_playwright_navigation_timeout_ms = (
+        args.playwright_navigation_timeout_ms
+        if args.playwright_navigation_timeout_ms is not None
+        else playwright_env["navigation_timeout_ms"]
+    )
+    resolved_playwright_total_timeout_ms = (
+        args.playwright_total_timeout_ms
+        if args.playwright_total_timeout_ms is not None
+        else (
+            playwright_env["total_timeout_ms"]
+            if playwright_env["total_timeout_ms"]
+            else max(180_000, int(resolved_playwright_navigation_timeout_ms) * 3)
+        )
+    )
+    playwright_enabled = infer_playwright_browser_fallback_enabled(
+        explicit_enabled=args.acm_browser_fallback,
+        env_enabled=playwright_env["enabled"],
+        cdp_url=resolved_playwright_cdp_url,
+        user_data_dir=resolved_playwright_user_data_dir,
+    )
     playwright_headless = playwright_env["headless"] if args.playwright_headless is None else bool(args.playwright_headless)
     playwright_config = build_playwright_download_config(
         enabled=playwright_enabled,
-        cdp_url=args.playwright_cdp_url or playwright_env["cdp_url"],
+        cdp_url=resolved_playwright_cdp_url,
         browser_executable_path=args.playwright_browser_executable or playwright_env["browser_executable_path"],
-        user_data_dir=args.playwright_user_data_dir or playwright_env["user_data_dir"],
+        user_data_dir=resolved_playwright_user_data_dir,
         profile_directory=args.playwright_profile_directory or playwright_env["profile_directory"],
         headless=playwright_headless,
-        launch_timeout_ms=args.playwright_launch_timeout_ms
-        if args.playwright_launch_timeout_ms is not None
-        else playwright_env["launch_timeout_ms"],
-        navigation_timeout_ms=args.playwright_navigation_timeout_ms
-        if args.playwright_navigation_timeout_ms is not None
-        else playwright_env["navigation_timeout_ms"],
+        launch_timeout_ms=resolved_playwright_launch_timeout_ms,
+        navigation_timeout_ms=resolved_playwright_navigation_timeout_ms,
+        total_timeout_ms=resolved_playwright_total_timeout_ms,
     )
+    requested_playwright_pool_size = args.playwright_download_pool_size
+    if requested_playwright_pool_size is None:
+        requested_playwright_pool_size = playwright_env["download_pool_size"] or None
+    resolved_playwright_pool_size = 0
+    if playwright_config is not None:
+        if requested_playwright_pool_size is None:
+            resolved_playwright_pool_size = max(1, min(args.download_workers, 4))
+        else:
+            resolved_playwright_pool_size = max(1, min(int(requested_playwright_pool_size), max(1, args.download_workers)))
     browser_pdf_downloader = (
-        PlaywrightPDFDownloader(
-            config=playwright_config,
-            download_max_bytes=args.download_max_bytes,
-            user_agent=args.http_user_agent,
-            accept_language=DEFAULT_ACCEPT_LANGUAGE,
+        (
+            BrowserPDFDownloaderPool(
+                [
+                    PlaywrightPDFDownloader(
+                        config=playwright_config,
+                        download_max_bytes=args.download_max_bytes,
+                        user_agent=args.http_user_agent,
+                        accept_language=DEFAULT_ACCEPT_LANGUAGE,
+                        slot_label=f"slot-{index + 1}",
+                    )
+                    for index in range(resolved_playwright_pool_size)
+                ]
+            )
+            if resolved_playwright_pool_size > 1
+            else PlaywrightPDFDownloader(
+                config=playwright_config,
+                download_max_bytes=args.download_max_bytes,
+                user_agent=args.http_user_agent,
+                accept_language=DEFAULT_ACCEPT_LANGUAGE,
+                slot_label="slot-1",
+            )
         )
         if playwright_config is not None
         else None
@@ -1271,6 +1598,8 @@ def main() -> int:
         playwright_user_data_dir=playwright_config.user_data_dir if playwright_config else None,
         playwright_profile_directory=playwright_config.profile_directory if playwright_config else None,
         playwright_headless=playwright_config.headless if playwright_config else None,
+        playwright_download_pool_size=resolved_playwright_pool_size if playwright_config else None,
+        playwright_total_timeout_ms=playwright_config.total_timeout_ms if playwright_config else None,
     )
 
     service = ConferenceFetchService(

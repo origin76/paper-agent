@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ DEFAULT_PLAYWRIGHT_PROFILE_DIRECTORY_ENV = "PAPER_AGENT_PLAYWRIGHT_PROFILE_DIREC
 DEFAULT_PLAYWRIGHT_HEADLESS_ENV = "PAPER_AGENT_PLAYWRIGHT_HEADLESS"
 DEFAULT_PLAYWRIGHT_LAUNCH_TIMEOUT_MS_ENV = "PAPER_AGENT_PLAYWRIGHT_LAUNCH_TIMEOUT_MS"
 DEFAULT_PLAYWRIGHT_NAVIGATION_TIMEOUT_MS_ENV = "PAPER_AGENT_PLAYWRIGHT_NAVIGATION_TIMEOUT_MS"
+DEFAULT_PLAYWRIGHT_DOWNLOAD_POOL_SIZE_ENV = "PAPER_AGENT_PLAYWRIGHT_DOWNLOAD_POOL_SIZE"
+DEFAULT_PLAYWRIGHT_TOTAL_TIMEOUT_MS_ENV = "PAPER_AGENT_PLAYWRIGHT_TOTAL_TIMEOUT_MS"
 
 
 class BrowserPDFDownloader(Protocol):
@@ -37,6 +40,7 @@ class PlaywrightDownloadConfig:
     headless: bool = False
     launch_timeout_ms: int = 30_000
     navigation_timeout_ms: int = 45_000
+    total_timeout_ms: int = 180_000
 
     @property
     def mode_label(self) -> str:
@@ -65,6 +69,20 @@ def parse_int_env(raw_value: str | None, default: int) -> int:
         return default
 
 
+def infer_playwright_browser_fallback_enabled(
+    *,
+    explicit_enabled: bool | None,
+    env_enabled: bool,
+    cdp_url: str | None,
+    user_data_dir: str | Path | None,
+) -> bool:
+    if explicit_enabled is not None:
+        return bool(explicit_enabled)
+    if env_enabled:
+        return True
+    return bool((str(cdp_url or "").strip()) or (str(user_data_dir or "").strip()))
+
+
 def default_chrome_executable_path() -> str | None:
     candidates = [
         Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
@@ -84,11 +102,13 @@ class PlaywrightPDFDownloader:
         download_max_bytes: int,
         user_agent: str,
         accept_language: str,
+        slot_label: str | None = None,
     ) -> None:
         self.config = config
         self.download_max_bytes = download_max_bytes
         self.user_agent = user_agent
         self.accept_language = accept_language
+        self.slot_label = slot_label
         self._lock = threading.Lock()
 
     def download_pdf(self, url: str, destination: Path, *, referer: str | None = None) -> dict[str, Any]:
@@ -99,16 +119,20 @@ class PlaywrightPDFDownloader:
         sync_playwright, playwright_timeout_error, playwright_error = _import_playwright_sync()
 
         start_time = time.perf_counter()
+        deadline = start_time + (self.config.total_timeout_ms / 1000)
+        current_stage = "initialize"
         log_event(
             "info",
             "Playwright PDF download started",
             url=url,
             destination=destination,
             mode=self.config.mode_label,
+            slot=self.slot_label,
             cdp_url=self.config.cdp_url,
             user_data_dir=self.config.user_data_dir,
             profile_directory=self.config.profile_directory,
             headless=self.config.headless,
+            total_timeout_ms=self.config.total_timeout_ms,
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = destination.with_suffix(destination.suffix + ".part")
@@ -123,20 +147,79 @@ class PlaywrightPDFDownloader:
 
         try:
             with sync_playwright() as playwright:
-                context, page, browser = self._open_page(playwright)
-                page.set_default_timeout(self.config.navigation_timeout_ms)
-                page.set_default_navigation_timeout(self.config.navigation_timeout_ms)
+                current_stage = "open_page"
+                open_timeout_ms = self._stage_timeout_ms(deadline, self.config.launch_timeout_ms, stage=current_stage)
+                log_event(
+                    "info",
+                    "Playwright browser session opening",
+                    url=url,
+                    destination=destination,
+                    slot=self.slot_label,
+                    stage=current_stage,
+                    timeout_ms=open_timeout_ms,
+                )
+                context, page, browser = self._open_page(playwright, timeout_ms=open_timeout_ms)
+                log_event(
+                    "info",
+                    "Playwright browser session ready",
+                    url=url,
+                    destination=destination,
+                    slot=self.slot_label,
+                    stage=current_stage,
+                )
+                per_step_timeout_ms = self._stage_timeout_ms(deadline, self.config.navigation_timeout_ms, stage="bootstrap_prepare")
+                page.set_default_timeout(per_step_timeout_ms)
+                page.set_default_navigation_timeout(per_step_timeout_ms)
                 page.set_extra_http_headers({"Accept-Language": self.accept_language})
                 bootstrap_url = self._bootstrap_url(url, referer=referer)
-                page.goto(bootstrap_url, wait_until="domcontentloaded")
-                self._wait_for_bootstrap_ready(page, bootstrap_url)
-                self._dismiss_cookie_banner(page)
+                current_stage = "bootstrap_goto"
+                bootstrap_goto_timeout_ms = self._stage_timeout_ms(deadline, self.config.navigation_timeout_ms, stage=current_stage)
+                log_event(
+                    "info",
+                    "Playwright bootstrap navigation started",
+                    url=url,
+                    bootstrap_url=bootstrap_url,
+                    destination=destination,
+                    slot=self.slot_label,
+                    stage=current_stage,
+                    timeout_ms=bootstrap_goto_timeout_ms,
+                )
+                page.goto(bootstrap_url, wait_until="domcontentloaded", timeout=bootstrap_goto_timeout_ms)
+                log_event(
+                    "info",
+                    "Playwright bootstrap navigation finished",
+                    url=url,
+                    bootstrap_url=bootstrap_url,
+                    destination=destination,
+                    slot=self.slot_label,
+                    stage=current_stage,
+                    current_url=self._safe_page_url(page),
+                    title=self._safe_page_title(page),
+                )
+                current_stage = "bootstrap_wait"
+                bootstrap_wait_timeout_ms = self._stage_timeout_ms(deadline, self.config.navigation_timeout_ms, stage=current_stage)
+                log_event(
+                    "info",
+                    "Playwright bootstrap readiness wait started",
+                    url=url,
+                    bootstrap_url=bootstrap_url,
+                    destination=destination,
+                    slot=self.slot_label,
+                    stage=current_stage,
+                    timeout_ms=bootstrap_wait_timeout_ms,
+                )
+                self._wait_for_bootstrap_ready(page, bootstrap_url, timeout_ms=bootstrap_wait_timeout_ms)
+                current_stage = "cookie_banner"
+                cookie_banner_timeout_ms = self._stage_timeout_ms(deadline, 2_000, stage=current_stage)
+                self._dismiss_cookie_banner(page, budget_ms=cookie_banner_timeout_ms)
+                current_stage = "pdf_fetch"
                 pdf_payload = self._fetch_pdf_payload(
                     context,
                     page,
                     url,
                     referer=referer,
                     timeout_error=playwright_timeout_error,
+                    deadline=deadline,
                 )
                 final_url = str(pdf_payload.get("final_url") or page.url or url)
                 content_type = str(pdf_payload.get("content_type") or "")
@@ -152,15 +235,18 @@ class PlaywrightPDFDownloader:
                     raise RuntimeError(
                         f"Playwright captured non-PDF content: {final_url} ({content_type or 'unknown content-type'})"
                     )
+                current_stage = "write_file"
                 tmp_path.write_bytes(raw_bytes)
         except (playwright_timeout_error, playwright_error) as exc:  # type: ignore[misc]
             if tmp_path.exists():
                 tmp_path.unlink()
-            raise RuntimeError(f"Playwright browser download failed: {exc}") from exc
-        except Exception:
+            raise RuntimeError(f"Playwright browser download failed during stage={current_stage}: {exc}") from exc
+        except Exception as exc:
             if tmp_path.exists():
                 tmp_path.unlink()
-            raise
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(f"Playwright browser download failed during stage={current_stage}: {exc}") from exc
         finally:
             try:
                 if page is not None:
@@ -188,6 +274,7 @@ class PlaywrightPDFDownloader:
             destination=destination,
             byte_count=byte_count,
             content_type=content_type,
+            slot=self.slot_label,
             duration_seconds=f"{time.perf_counter() - start_time:.2f}",
         )
         return {
@@ -199,9 +286,16 @@ class PlaywrightPDFDownloader:
             "transport": f"playwright:{self.config.mode_label}",
         }
 
-    def _open_page(self, playwright: Any) -> tuple[Any, Any, Any | None]:
+    @staticmethod
+    def _stage_timeout_ms(deadline: float, fallback_ms: int, *, stage: str) -> int:
+        remaining_ms = max(0, int((deadline - time.perf_counter()) * 1000))
+        if remaining_ms <= 0:
+            raise RuntimeError(f"Playwright total timeout exceeded before stage={stage}")
+        return max(1, min(int(fallback_ms), remaining_ms))
+
+    def _open_page(self, playwright: Any, *, timeout_ms: int) -> tuple[Any, Any, Any | None]:
         if self.config.cdp_url:
-            browser = playwright.chromium.connect_over_cdp(self.config.cdp_url, timeout=self.config.launch_timeout_ms)
+            browser = playwright.chromium.connect_over_cdp(self.config.cdp_url, timeout=timeout_ms)
             if not browser.contexts:
                 raise RuntimeError(
                     "Connected to Chrome CDP endpoint, but no browser context is available. "
@@ -229,7 +323,7 @@ class PlaywrightPDFDownloader:
             args=launch_args,
             accept_downloads=True,
             viewport={"width": 1440, "height": 960},
-            timeout=self.config.launch_timeout_ms,
+            timeout=timeout_ms,
         )
         page = context.new_page()
         return context, page, None
@@ -259,54 +353,118 @@ class PlaywrightPDFDownloader:
         *,
         referer: str | None,
         timeout_error: type[BaseException],
+        deadline: float,
     ) -> dict[str, Any]:
+        cookie_fetch_timeout_ms = self._stage_timeout_ms(deadline, self.config.navigation_timeout_ms, stage="cookie_fetch")
+        log_event(
+            "info",
+            "Playwright cookie-backed PDF fetch started",
+            url=url,
+            slot=self.slot_label,
+            stage="cookie_fetch",
+            timeout_ms=cookie_fetch_timeout_ms,
+        )
         try:
-            return self._fetch_pdf_via_context_cookies(context, url, referer=referer)
+            payload = self._fetch_pdf_via_context_cookies(
+                context,
+                url,
+                referer=referer,
+                timeout_seconds=max(0.1, cookie_fetch_timeout_ms / 1000),
+            )
+            log_event(
+                "info",
+                "Playwright cookie-backed PDF fetch finished",
+                url=url,
+                slot=self.slot_label,
+                stage="cookie_fetch",
+                byte_length=payload.get("byte_length") or 0,
+                final_url=payload.get("final_url") or url,
+            )
+            return payload
         except timeout_error:
             raise
         except Exception as exc:
             log_event(
                 "warning",
-                "Playwright cookie-backed PDF download failed, falling back to in-browser fetch",
+                "Playwright cookie-backed PDF fetch failed, falling back to in-browser fetch",
                 url=url,
+                slot=self.slot_label,
+                stage="cookie_fetch",
                 error=str(exc),
             )
 
+        browser_fetch_timeout_ms = self._stage_timeout_ms(deadline, self.config.navigation_timeout_ms, stage="in_browser_fetch")
+        log_event(
+            "info",
+            "Playwright in-browser PDF fetch started",
+            url=url,
+            slot=self.slot_label,
+            stage="in_browser_fetch",
+            timeout_ms=browser_fetch_timeout_ms,
+        )
         try:
             payload = page.evaluate(
-                """async (targetUrl) => {
-                    const response = await fetch(targetUrl, { credentials: 'include' });
-                    const blob = await response.blob();
-                    const bodyBase64 = await new Promise((resolve, reject) => {
-                        const reader = new FileReader();
-                        reader.onerror = () => reject(reader.error || new Error("FileReader failed"));
-                        reader.onload = () => {
-                            const result = String(reader.result || "");
-                            const commaIndex = result.indexOf(",");
-                            resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : "");
+                """async ({ targetUrl, timeoutMs }) => {
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(new Error("fetch timeout")), timeoutMs);
+                    try {
+                        const response = await fetch(targetUrl, { credentials: 'include', signal: controller.signal });
+                        const blob = await response.blob();
+                        const bodyBase64 = await new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onerror = () => reject(reader.error || new Error("FileReader failed"));
+                            reader.onload = () => {
+                                const result = String(reader.result || "");
+                                const commaIndex = result.indexOf(",");
+                                resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : "");
+                            };
+                            reader.readAsDataURL(blob);
+                        });
+                        return {
+                            ok: response.ok,
+                            status: response.status,
+                            statusText: response.statusText || "",
+                            finalUrl: response.url || targetUrl,
+                            contentType: response.headers.get("content-type") || "",
+                            byteLength: blob.size,
+                            bodyBase64,
+                            error: "",
                         };
-                        reader.readAsDataURL(blob);
-                    });
-                    return {
-                        ok: response.ok,
-                        status: response.status,
-                        statusText: response.statusText || "",
-                        finalUrl: response.url || targetUrl,
-                        contentType: response.headers.get("content-type") || "",
-                        byteLength: blob.size,
-                        bodyBase64,
-                    };
+                    } catch (error) {
+                        const message = error instanceof Error ? error.message : String(error || "unknown error");
+                        return {
+                            ok: false,
+                            status: 0,
+                            statusText: "",
+                            finalUrl: targetUrl,
+                            contentType: "",
+                            byteLength: 0,
+                            bodyBase64: "",
+                            error: message,
+                        };
+                    } finally {
+                        clearTimeout(timer);
+                    }
                 }""",
-                url,
+                {"targetUrl": url, "timeoutMs": browser_fetch_timeout_ms},
             )
         except timeout_error as exc:
-            raise RuntimeError("Playwright did not observe a PDF response") from exc
+            raise RuntimeError("Playwright in-browser fetch timed out while waiting for a PDF response") from exc
 
         status = int(payload.get("status") or 0)
         if not payload.get("ok"):
             raise RuntimeError(
-                f"Playwright in-browser fetch returned HTTP {status}: {payload.get('statusText') or 'unknown error'}"
+                f"Playwright in-browser fetch failed: {payload.get('error') or payload.get('statusText') or f'HTTP {status}'}"
             )
+        log_event(
+            "info",
+            "Playwright in-browser PDF fetch finished",
+            url=url,
+            slot=self.slot_label,
+            stage="in_browser_fetch",
+            byte_length=payload.get("byteLength") or 0,
+            final_url=payload.get("finalUrl") or url,
+        )
         return {
             "final_url": payload.get("finalUrl") or url,
             "content_type": payload.get("contentType") or "",
@@ -320,6 +478,7 @@ class PlaywrightPDFDownloader:
         url: str,
         *,
         referer: str | None,
+        timeout_seconds: float,
     ) -> dict[str, Any]:
         cookies = context.cookies([url])
         cookie_header = "; ".join(
@@ -343,7 +502,7 @@ class PlaywrightPDFDownloader:
         raw_bytes = b""
         final_url = url
         content_type = ""
-        with urlopen(Request(url, headers=headers), timeout=self.config.navigation_timeout_ms / 1000) as response:
+        with urlopen(Request(url, headers=headers), timeout=timeout_seconds) as response:
             final_url = response.geturl() or url
             content_type = response.headers.get("Content-Type", "")
             raw_bytes = response.read(self.download_max_bytes + 1)
@@ -362,24 +521,23 @@ class PlaywrightPDFDownloader:
             "body_base64": base64.b64encode(raw_bytes).decode("ascii"),
         }
 
-    def _wait_for_bootstrap_ready(self, page: Any, bootstrap_url: str) -> None:
-        max_wait_seconds = max(20.0, min(90.0, self.config.navigation_timeout_ms / 1000))
+    def _wait_for_bootstrap_ready(self, page: Any, bootstrap_url: str, *, timeout_ms: int) -> None:
+        max_wait_seconds = max(0.1, timeout_ms / 1000)
         deadline = time.perf_counter() + max_wait_seconds
         while time.perf_counter() < deadline:
-            dismissed_banner = self._dismiss_cookie_banner(page)
-            if dismissed_banner:
-                page.wait_for_timeout(1_000)
             try:
                 title = str(page.title() or "").strip()
                 current_url = str(page.url or "").strip()
             except Exception:
-                page.wait_for_timeout(500)
+                remaining_wait_ms = max(100, min(500, int((deadline - time.perf_counter()) * 1000)))
+                page.wait_for_timeout(remaining_wait_ms)
                 continue
             if not self._looks_like_browser_challenge(current_url, title):
                 log_event(
                     "info",
                     "Playwright bootstrap page ready",
                     bootstrap_url=bootstrap_url,
+                    slot=self.slot_label,
                     current_url=current_url,
                     title=title,
                 )
@@ -388,15 +546,18 @@ class PlaywrightPDFDownloader:
                 "info",
                 "Playwright waiting for browser challenge",
                 bootstrap_url=bootstrap_url,
+                slot=self.slot_label,
                 current_url=current_url,
                 title=title,
             )
-            page.wait_for_timeout(2_000)
+            remaining_wait_ms = max(100, min(2_000, int((deadline - time.perf_counter()) * 1000)))
+            page.wait_for_timeout(remaining_wait_ms)
 
         log_event(
             "warning",
             "Playwright bootstrap challenge did not clear before timeout",
             bootstrap_url=bootstrap_url,
+            slot=self.slot_label,
             current_url=self._safe_page_url(page),
             title=self._safe_page_title(page),
         )
@@ -430,12 +591,51 @@ class PlaywrightPDFDownloader:
         except Exception:
             return ""
 
-    def _dismiss_cookie_banner(self, page: Any) -> bool:
-        button_ids = (
-            "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
-            "CybotCookiebotDialogBodyButtonAccept",
-            "CybotCookiebotDialogBodyButtonAcceptRecommended",
+    @staticmethod
+    def _safe_frame_url(frame: Any) -> str:
+        try:
+            return str(frame.url or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _safe_frame_name(frame: Any) -> str:
+        try:
+            return str(frame.name or "").strip()
+        except Exception:
+            return ""
+
+    def _candidate_cookie_targets(self, page: Any) -> list[tuple[str, Any, str]]:
+        targets: list[tuple[str, Any, str]] = [("page", page, self._safe_page_url(page))]
+        frame_hints = (
+            "cookie",
+            "consent",
+            "cybot",
+            "cookiebot",
+            "onetrust",
+            "trustarc",
+            "privacy",
         )
+        seen_keys = {("page", targets[0][2])}
+        try:
+            frames = list(page.frames)
+        except Exception:
+            frames = []
+        for frame in frames:
+            frame_url = self._safe_frame_url(frame)
+            frame_name = self._safe_frame_name(frame)
+            lowered = f"{frame_name} {frame_url}".lower()
+            if not any(hint in lowered for hint in frame_hints):
+                continue
+            key = (frame_name or "frame", frame_url)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            label = frame_name or "frame"
+            targets.append((label, frame, frame_url))
+        return targets
+
+    def _dismiss_cookie_banner(self, page: Any, *, budget_ms: int) -> bool:
         selectors = (
             "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
             "#CybotCookiebotDialogBodyButtonAccept",
@@ -451,51 +651,71 @@ class PlaywrightPDFDownloader:
             "button:has-text('接受')",
             "button:has-text('全部接受')",
         )
-        frames = []
-        try:
-            frames = list(page.frames)
-        except Exception:
-            frames = [page]
-        for frame in frames or [page]:
-            try:
-                clicked_id = frame.evaluate(
-                    """(ids) => {
-                        for (const id of ids) {
-                            const element = document.getElementById(id);
-                            if (element) {
-                                element.click();
-                                return id;
-                            }
-                        }
-                        return "";
-                    }""",
-                    list(button_ids),
-                )
-                if clicked_id:
-                    log_event(
-                        "info",
-                        "Playwright cookie banner accepted",
-                        selector=f"#{clicked_id}",
-                        current_url=self._safe_page_url(page),
-                    )
-                    return True
-            except Exception:
-                pass
+        start_time = time.perf_counter()
+        deadline = time.perf_counter() + max(0.1, budget_ms / 1000)
+        targets = self._candidate_cookie_targets(page)
+        log_event(
+            "info",
+            "Playwright cookie banner scan started",
+            slot=self.slot_label,
+            current_url=self._safe_page_url(page),
+            budget_ms=budget_ms,
+            target_count=len(targets),
+        )
+        for target_label, frame, frame_url in targets:
+            if time.perf_counter() >= deadline:
+                break
             for selector in selectors:
+                remaining_ms = int((deadline - time.perf_counter()) * 1000)
+                if remaining_ms <= 0:
+                    break
                 try:
                     locator = frame.locator(selector).first
-                    if locator.is_visible(timeout=500):
-                        locator.click(timeout=1_500)
+                    visible_timeout_ms = max(50, min(200, remaining_ms))
+                    if locator.is_visible(timeout=visible_timeout_ms):
+                        click_timeout_ms = max(100, min(800, remaining_ms))
+                        locator.click(timeout=click_timeout_ms)
                         log_event(
                             "info",
                             "Playwright cookie banner accepted",
                             selector=selector,
+                            slot=self.slot_label,
                             current_url=self._safe_page_url(page),
+                            target=target_label,
+                            frame_url=frame_url,
+                            duration_ms=int((time.perf_counter() - start_time) * 1000),
                         )
                         return True
                 except Exception:
                     continue
+        log_event(
+            "info",
+            "Playwright cookie banner scan finished",
+            slot=self.slot_label,
+            current_url=self._safe_page_url(page),
+            accepted=False,
+            target_count=len(targets),
+            duration_ms=int((time.perf_counter() - start_time) * 1000),
+        )
         return False
+
+
+class BrowserPDFDownloaderPool:
+    def __init__(self, downloaders: list[BrowserPDFDownloader]) -> None:
+        if not downloaders:
+            raise ValueError("BrowserPDFDownloaderPool requires at least one downloader")
+        self._downloaders = list(downloaders)
+        self.pool_size = len(self._downloaders)
+        self._available_indexes: queue.Queue[int] = queue.Queue()
+        for index in range(self.pool_size):
+            self._available_indexes.put(index)
+
+    def download_pdf(self, url: str, destination: Path, *, referer: str | None = None) -> dict[str, Any]:
+        downloader_index = self._available_indexes.get()
+        try:
+            return self._downloaders[downloader_index].download_pdf(url, destination, referer=referer)
+        finally:
+            self._available_indexes.put(downloader_index)
 
 
 def build_playwright_download_config(
@@ -508,6 +728,7 @@ def build_playwright_download_config(
     headless: bool,
     launch_timeout_ms: int,
     navigation_timeout_ms: int,
+    total_timeout_ms: int,
 ) -> PlaywrightDownloadConfig | None:
     if not enabled:
         return None
@@ -523,6 +744,7 @@ def build_playwright_download_config(
         headless=headless,
         launch_timeout_ms=max(1_000, int(launch_timeout_ms)),
         navigation_timeout_ms=max(1_000, int(navigation_timeout_ms)),
+        total_timeout_ms=max(5_000, int(total_timeout_ms)),
     )
 
 
@@ -549,4 +771,6 @@ def resolve_playwright_env_config() -> dict[str, Any]:
         "headless": parse_bool_env(os.getenv(DEFAULT_PLAYWRIGHT_HEADLESS_ENV), default=False),
         "launch_timeout_ms": parse_int_env(os.getenv(DEFAULT_PLAYWRIGHT_LAUNCH_TIMEOUT_MS_ENV), default=30_000),
         "navigation_timeout_ms": parse_int_env(os.getenv(DEFAULT_PLAYWRIGHT_NAVIGATION_TIMEOUT_MS_ENV), default=45_000),
+        "download_pool_size": parse_int_env(os.getenv(DEFAULT_PLAYWRIGHT_DOWNLOAD_POOL_SIZE_ENV), default=0),
+        "total_timeout_ms": parse_int_env(os.getenv(DEFAULT_PLAYWRIGHT_TOTAL_TIMEOUT_MS_ENV), default=180_000),
     }

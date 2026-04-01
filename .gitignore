@@ -9,3 +9,8 @@ zotero-paper-agent-final-pdfs/
 conference-papers/
 conference-parse-ready-final-pdfs/
 tests/
+*-runs/
+*-pdfs/
+*-parse-ready-final-pdfs/
+*-arcs/
+*test/

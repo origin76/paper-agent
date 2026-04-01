@@ -21,6 +21,9 @@ dependencies = [
 [project.scripts]
 paper-agent = "paper_agent.cli:main"
 paper-agent-fetch = "paper_agent.conference_fetch:main"
+paper-agent-chrome-cdp = "paper_agent.chrome_cdp:main"
+paper-agent-narrative = "paper_agent.narrative:main"
+paper-agent-narrative-detail = "paper_agent.narrative_detail:main"
 
 [tool.setuptools]
 packages = ["paper_agent"]

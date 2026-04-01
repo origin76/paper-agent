@@ -349,3 +349,75 @@ Resource discovery:
 - 建议必须可执行，不能空泛。
 - 要像真实研究规划，而不是泛泛 brainstorm。
 """
+
+
+def build_narrative_arc_section_detail_prompt(
+    section_key: str,
+    section_title: str,
+    section_focus: str,
+    arc_payload: dict[str, Any],
+    evidence_bundle_payload: dict[str, Any],
+) -> str:
+    return f"""你正在细化一条研究故事线里的单个小标题。
+目标不是给出摘要，而是把这个小标题写成真正可读、可追溯、像导师带学生读论文时会讲出来的段落。
+
+当前小标题：
+- section_key: {section_key}
+- section_title: {section_title}
+- section_focus: {section_focus}
+
+故事线骨架：
+{json.dumps(arc_payload, indent=2, ensure_ascii=False)}
+
+代表论文证据包：
+{json.dumps(evidence_bundle_payload, indent=2, ensure_ascii=False)}
+
+返回一个 JSON 对象，必须包含这些键：
+- section_key: string
+- section_title: string
+- section_summary: string
+- paragraphs: string[]
+- evidence_points: [{{"paper_id": string, "paper_label": string, "note": string}}]
+- anchor_papers: string[]
+
+写作规则：
+- 所有 value 必须使用简体中文。
+- `paragraphs` 写 2-4 段，每段都要是完整叙述，不要写成碎 bullet。
+- 重点讲“问题如何被定义、方法如何成形、为什么发生转向、今天还卡在哪”，不要泛泛夸论文。
+- 必须尽量把作者主张、证据强度、默认假设和路线变化讲清楚。
+- 优先引用证据包中的具体论文标题，不要只说“有些工作”“后续论文”。
+- `evidence_points` 只保留 2-4 个最关键锚点，每个 `note` 说明这篇论文在这个小标题里扮演什么角色。
+- `anchor_papers` 只放标题，不要放网址。
+- 不要输出额外的键。
+"""
+
+
+def build_narrative_arc_supporting_detail_prompt(
+    arc_payload: dict[str, Any],
+    evidence_bundle_payload: dict[str, Any],
+) -> str:
+    return f"""你正在把一条研究故事线的辅助章节补写扎实。
+这些章节包括：整条线的总定位、代表转折点、导师带读路径、年度推进、仍然悬而未决的问题。
+
+故事线骨架：
+{json.dumps(arc_payload, indent=2, ensure_ascii=False)}
+
+代表论文证据包：
+{json.dumps(evidence_bundle_payload, indent=2, ensure_ascii=False)}
+
+返回一个 JSON 对象，必须包含这些键：
+- arc_overview: string
+- turning_points_detailed: [{{"paper_id": string, "paper_label": string, "year": string | number | null, "what_changed": string, "why_it_mattered": string, "reading_question": string}}]
+- reading_path_detailed: [{{"paper_id": string, "paper_label": string, "year": string | number | null, "stage_label": string, "why_read_now": string, "focus_question": string, "next_connection": string}}]
+- year_progression_detailed: [{{"year": string | number | null, "narrative": string, "representative_papers": string[], "shift": string}}]
+- open_tensions_detailed: [{{"tension": string, "why_it_persists": string, "what_to_watch": string}}]
+
+写作规则：
+- 所有 value 必须使用简体中文。
+- `arc_overview` 要像这一条线的导言，2-4 句，讲清这条线到底在争什么。
+- `turning_points_detailed` 不要只说“很重要”，要说明它改写了哪一个默认路线。
+- `reading_path_detailed` 要有阅读节奏感，像老师真的在安排顺序，而不是简单罗列。
+- `year_progression_detailed` 要写出每一年到底推进了什么，不要只是改写题目。
+- `open_tensions_detailed` 要像真正的研究问题，而不是泛泛的“需要更多实验”。
+- 不要输出额外的键。
+"""
