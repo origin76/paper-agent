@@ -231,7 +231,7 @@ CLI 入口都定义在 [pyproject.toml](/Users/zerick/code/longchain/pyproject.t
 ## 5. 共用基础设施
 
 - [config.py](/Users/zerick/code/longchain/paper_agent/config.py)
-  统一读取 `.env / .env.example` 并生成运行配置。
+  统一读取 `.env` 并生成运行配置；`.env.example` 仅作为模板，不会自动生效。
 - [runtime.py](/Users/zerick/code/longchain/paper_agent/runtime.py)
   统一日志和 `stage_trace.jsonl`。
 - [utils.py](/Users/zerick/code/longchain/paper_agent/utils.py)

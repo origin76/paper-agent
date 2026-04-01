@@ -28,20 +28,28 @@ def _parse_float(value: str | None, default: float) -> float:
     return float(value.strip())
 
 
-def _load_local_env_files() -> None:
+def _iter_local_env_files(
+    *,
+    cwd: Path | None = None,
+    project_root: Path | None = None,
+) -> tuple[Path, ...]:
     candidates = [
-        Path.cwd() / ".env",
-        Path.cwd() / ".env.example",
-        Path(__file__).resolve().parent.parent / ".env",
-        Path(__file__).resolve().parent.parent / ".env.example",
+        (cwd or Path.cwd()).resolve() / ".env",
+        (project_root or Path(__file__).resolve().parent.parent).resolve() / ".env",
     ]
-    loaded: set[Path] = set()
+    resolved_files: list[Path] = []
+    seen: set[Path] = set()
     for candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved in loaded or not resolved.exists():
+        if candidate in seen or not candidate.exists():
             continue
-        load_dotenv(dotenv_path=resolved, override=False)
-        loaded.add(resolved)
+        seen.add(candidate)
+        resolved_files.append(candidate)
+    return tuple(resolved_files)
+
+
+def _load_local_env_files() -> None:
+    for env_file in _iter_local_env_files():
+        load_dotenv(dotenv_path=env_file, override=False)
 
 
 @dataclass(frozen=True)

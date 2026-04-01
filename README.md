@@ -146,7 +146,7 @@ Optional:
 - `PAPER_AGENT_OUTPUT_ROOT`
   - default: `runs`
 
-The runtime auto-loads `.env` and `.env.example`.
+The runtime auto-loads `.env` only. `.env.example` is a template and is never loaded automatically.
 
 ## Usage
 
