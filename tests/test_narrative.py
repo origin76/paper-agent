@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from paper_agent.narrative import build_paper_profile, build_story_arcs, load_paper_profiles, render_narrative_markdown
+from paper_agent.narrative import PaperProfile, build_paper_profile, build_story_arcs, load_paper_profiles, render_narrative_markdown
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -86,6 +86,94 @@ def _make_run_dir(
 
 
 class NarrativeModuleTests(unittest.TestCase):
+    def test_build_story_arcs_reassigns_over_broad_themes_for_popl_only_corpus(self) -> None:
+        def make_profile(
+            idx: int,
+            title: str,
+            primary_theme: str,
+            theme_scores: dict[str, int],
+        ) -> PaperProfile:
+            return PaperProfile(
+                paper_id=f"paper-{idx}",
+                identity_key=f"id-{idx}",
+                run_dir=f"/tmp/run-{idx}",
+                pdf_path=f"/tmp/{idx}.pdf",
+                display_title=title,
+                source_title=title,
+                venue="POPL",
+                venue_short="POPL",
+                publication_year=2024,
+                authors=[],
+                paper_type="研究论文",
+                takeaway="",
+                problem_statement="",
+                prior_work_positioning="",
+                core_claims=[],
+                method_modules=[],
+                core_pipeline=[],
+                evaluation_goal="",
+                experiment_names=[],
+                missing_ablations=[],
+                reproducibility_risks=[],
+                code_resources=[],
+                official_resources=[],
+                keywords=[],
+                theme_scores=theme_scores,
+                primary_theme=primary_theme,
+                secondary_themes=[],
+                turning_markers=[],
+                profile_quality=1.0,
+            )
+
+        profiles = [
+            make_profile(
+                1,
+                "Quantum Local Reasoning",
+                "accelerators_gpu",
+                {"accelerators_gpu": 5, "quantum_reversible": 5, "verification_logic": 4},
+            ),
+            make_profile(
+                2,
+                "Symbolic Evaluation with Merging",
+                "distributed_data",
+                {"distributed_data": 6, "program_analysis": 3, "verification_logic": 2},
+            ),
+            make_profile(
+                3,
+                "Robot Demonstration Programs",
+                "ml_ai_systems",
+                {"ml_ai_systems": 5, "compilers_synthesis": 3, "type_systems": 2},
+            ),
+            make_profile(
+                4,
+                "Quantum Effects and Types",
+                "quantum_reversible",
+                {"quantum_reversible": 6, "type_systems": 4},
+            ),
+            make_profile(
+                5,
+                "Abstract Interpretation Precision",
+                "program_analysis",
+                {"program_analysis": 6, "verification_logic": 3},
+            ),
+            make_profile(
+                6,
+                "Sketch-Guided Synthesis",
+                "compilers_synthesis",
+                {"compilers_synthesis": 6, "type_systems": 3},
+            ),
+        ]
+
+        arcs = build_story_arcs(profiles, min_papers_per_arc=1, max_arcs=10)
+        theme_ids = {arc.theme_id for arc in arcs}
+
+        self.assertIn("quantum_reversible", theme_ids)
+        self.assertIn("program_analysis", theme_ids)
+        self.assertIn("compilers_synthesis", theme_ids)
+        self.assertNotIn("accelerators_gpu", theme_ids)
+        self.assertNotIn("distributed_data", theme_ids)
+        self.assertNotIn("ml_ai_systems", theme_ids)
+
     def test_build_paper_profile_infers_theme_and_source_title(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

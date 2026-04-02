@@ -361,7 +361,6 @@ THEME_DEFINITIONS: tuple[ThemeDefinition, ...] = (
             "restore",
             "fork",
             "memory management",
-            "系统",
             "操作系统",
             "内核",
             "运行时",
@@ -389,15 +388,12 @@ THEME_DEFINITIONS: tuple[ThemeDefinition, ...] = (
             "bft",
             "analytics",
             "database",
-            "query",
             "分布式",
             "一致性",
             "事务",
             "远程内存",
             "混合云",
             "数据库",
-            "查询",
-            "分析",
         ),
     ),
     ThemeDefinition(
@@ -459,7 +455,6 @@ THEME_DEFINITIONS: tuple[ThemeDefinition, ...] = (
             "large language model",
             "model serving",
             "training",
-            "inference",
             "rag",
             "in-context",
             "transformer",
@@ -469,7 +464,6 @@ THEME_DEFINITIONS: tuple[ThemeDefinition, ...] = (
             "大语言模型",
             "模型服务",
             "训练",
-            "推理",
         ),
     ),
     ThemeDefinition(
@@ -481,7 +475,6 @@ THEME_DEFINITIONS: tuple[ThemeDefinition, ...] = (
             "cuda",
             "accelerator",
             "heterogeneous",
-            "tensor",
             "operator optimization",
             "asynchronous copy",
             "remote memory scheduling",
@@ -489,8 +482,6 @@ THEME_DEFINITIONS: tuple[ThemeDefinition, ...] = (
             "gpu checkpoint",
             "加速器",
             "异构",
-            "算子",
-            "张量",
             "图形处理器",
         ),
     ),
@@ -512,6 +503,17 @@ THEME_DEFINITIONS: tuple[ThemeDefinition, ...] = (
     ),
 )
 THEME_BY_ID = {theme.id: theme for theme in THEME_DEFINITIONS}
+
+VENUE_THEME_POLICY: dict[str, tuple[str, ...]] = {
+    "POPL": (
+        "type_systems",
+        "verification_logic",
+        "program_analysis",
+        "compilers_synthesis",
+        "quantum_reversible",
+        "security_privacy",
+    ),
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -705,6 +707,38 @@ def _select_theme_ids(theme_scores: dict[str, int]) -> tuple[str, list[str]]:
         if score >= max(1, primary_score - 2):
             secondaries.append(theme_id)
     return primary, secondaries
+
+
+def _resolve_theme_policy(profiles: list[PaperProfile]) -> tuple[str | None, tuple[str, ...] | None]:
+    venue_counter = Counter(profile.venue_short for profile in profiles if profile.venue_short)
+    if not venue_counter:
+        return None, None
+    dominant_venue, dominant_count = venue_counter.most_common(1)[0]
+    policy = VENUE_THEME_POLICY.get(dominant_venue)
+    if policy is None:
+        return dominant_venue, None
+    if dominant_count < max(1, int(len(profiles) * 0.9)):
+        return dominant_venue, None
+    return dominant_venue, policy
+
+
+def _select_effective_theme_id(
+    profile: PaperProfile,
+    allowed_theme_ids: tuple[str, ...] | None,
+) -> str:
+    if not allowed_theme_ids or profile.primary_theme in allowed_theme_ids:
+        return profile.primary_theme
+
+    allowed_rank = {theme_id: index for index, theme_id in enumerate(allowed_theme_ids)}
+    candidates = [
+        (theme_id, score)
+        for theme_id, score in profile.theme_scores.items()
+        if theme_id in allowed_rank
+    ]
+    if not candidates:
+        return profile.primary_theme
+    candidates.sort(key=lambda item: (-item[1], allowed_rank[item[0]], item[0]))
+    return candidates[0][0]
 
 
 def _extract_keywords(text_fragments: list[str], favored_phrases: list[str]) -> list[str]:
@@ -1161,11 +1195,13 @@ def build_story_arcs(
     min_papers_per_arc: int = 6,
     max_arcs: int = 10,
 ) -> list[StoryArc]:
+    _, allowed_theme_ids = _resolve_theme_policy(profiles)
     grouped: dict[str, list[PaperProfile]] = defaultdict(list)
     for profile in profiles:
-        if profile.primary_theme == GENERAL_THEME_ID:
+        effective_theme_id = _select_effective_theme_id(profile, allowed_theme_ids)
+        if effective_theme_id == GENERAL_THEME_ID:
             continue
-        grouped[profile.primary_theme].append(profile)
+        grouped[effective_theme_id].append(profile)
 
     arcs: list[StoryArc] = []
     for theme_id, items in grouped.items():
@@ -1214,7 +1250,12 @@ def _build_global_summary(profiles: list[PaperProfile], arcs: list[StoryArc]) ->
     years = [profile.publication_year for profile in profiles if profile.publication_year is not None]
     year_range = f"{min(years)}-{max(years)}" if years else "未知"
     venue_counter = Counter(profile.venue_short for profile in profiles)
-    theme_counter = Counter(profile.primary_theme for profile in profiles if profile.primary_theme != GENERAL_THEME_ID)
+    _, allowed_theme_ids = _resolve_theme_policy(profiles)
+    effective_theme_ids = [
+        _select_effective_theme_id(profile, allowed_theme_ids)
+        for profile in profiles
+    ]
+    theme_counter = Counter(theme_id for theme_id in effective_theme_ids if theme_id != GENERAL_THEME_ID)
     return {
         "paper_count": len(profiles),
         "arc_count": len(arcs),

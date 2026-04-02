@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from paper_agent.narrative_stack import detail as narrative_detail_impl
 from paper_agent.narrative import build_story_arcs, load_paper_profiles
 from paper_agent.narrative_detail import (
     ArcEvidenceBundle,
@@ -154,6 +155,37 @@ def _make_run_dir(
 
 
 class NarrativeDetailTests(unittest.TestCase):
+    def test_reset_detail_output_dir_removes_stale_generated_artifacts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            stale_files = [
+                "evidence_bundles.json",
+                "detailed_story_arcs.json",
+                "detailed_narrative_report.md",
+                "detailed_narrative_report.html",
+                "detailed_narrative_report.pdf",
+                "run_summary.json",
+                "run.log",
+                "stage_trace.jsonl",
+            ]
+            stale_dirs = ["arc_reports", "section_details", "debug"]
+
+            for name in stale_files:
+                _write_text(output_dir / name, "stale")
+            for name in stale_dirs:
+                _write_text(output_dir / name / "old.txt", "stale")
+            _write_text(output_dir / "keep-me.txt", "keep")
+
+            summary = narrative_detail_impl._reset_detail_output_dir(output_dir)
+
+            self.assertEqual(sorted(summary["removed_files"]), sorted(stale_files))
+            self.assertEqual(sorted(summary["removed_dirs"]), sorted(stale_dirs))
+            for name in stale_files:
+                self.assertFalse((output_dir / name).exists())
+            for name in stale_dirs:
+                self.assertFalse((output_dir / name).exists())
+            self.assertTrue((output_dir / "keep-me.txt").exists())
+
     def test_load_narrative_inputs_and_build_arc_evidence_bundle(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

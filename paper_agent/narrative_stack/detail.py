@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -30,6 +31,23 @@ from paper_agent.utils import slugify, write_json, write_text
 MULTISPACE_PATTERN = re.compile(r"\s+")
 LIST_ITEM_PATTERN = re.compile(r"^\s*(?:[-*]|\d+\.)\s+(.*)$")
 HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.*)$")
+
+DETAIL_OUTPUT_FILES = (
+    "evidence_bundles.json",
+    "detailed_story_arcs.json",
+    "detailed_narrative_report.md",
+    "detailed_narrative_report.html",
+    "detailed_narrative_report.pdf",
+    "run_summary.json",
+    "run.log",
+    "stage_trace.jsonl",
+)
+
+DETAIL_OUTPUT_DIRS = (
+    "arc_reports",
+    "section_details",
+    "debug",
+)
 
 SECTION_SPECS: dict[str, dict[str, str]] = {
     "setup": {
@@ -1322,6 +1340,25 @@ def _resolve_report_title(summary_payload: dict[str, Any], explicit_title: str |
     return "论文领域发展与转折叙事报告（细化版）"
 
 
+def _reset_detail_output_dir(output_dir: Path) -> dict[str, list[str]]:
+    removed_files: list[str] = []
+    removed_dirs: list[str] = []
+
+    for name in DETAIL_OUTPUT_FILES:
+        path = output_dir / name
+        if path.exists():
+            path.unlink()
+            removed_files.append(name)
+
+    for name in DETAIL_OUTPUT_DIRS:
+        path = output_dir / name
+        if path.exists():
+            shutil.rmtree(path)
+            removed_dirs.append(name)
+
+    return {"removed_files": removed_files, "removed_dirs": removed_dirs}
+
+
 def build_detailed_narrative_report(
     narrative_root: Path,
     output_dir: Path,
@@ -1334,7 +1371,25 @@ def build_detailed_narrative_report(
     log_level: str = "INFO",
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_summary = {"removed_files": [], "removed_dirs": []}
+    if not skip_existing:
+        cleanup_summary = _reset_detail_output_dir(output_dir)
     configure_logging(level=log_level, run_dir=output_dir)
+    append_stage_trace(
+        output_dir,
+        "prepare_output_dir",
+        "finished",
+        skip_existing=skip_existing,
+        removed_files=cleanup_summary["removed_files"],
+        removed_dirs=cleanup_summary["removed_dirs"],
+    )
+    log_event(
+        "info",
+        "Detailed narrative output directory prepared",
+        skip_existing=skip_existing,
+        removed_files=len(cleanup_summary["removed_files"]),
+        removed_dirs=len(cleanup_summary["removed_dirs"]),
+    )
 
     append_stage_trace(output_dir, "load_narrative_inputs", "started", narrative_root=str(narrative_root))
     profiles_by_id, arcs, summary_payload = load_narrative_inputs(narrative_root)
